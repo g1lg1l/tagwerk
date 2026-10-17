@@ -1,57 +1,81 @@
 # Tagwerk
 
-Analizza la tua musica in locale e la tagga da solo: BPM, key (Camelot), stile Discogs (techno, dub techno, minimal, acid, DnB…), mood, voce/strumentale ed energia. I risultati finiscono in un CSV e, se vuoi, nel campo *Comment* dei file, così rekordbox li può usare nelle intelligent playlist.
+Analyzes your music locally and tags it on its own: BPM, key (Camelot), Discogs style (techno, dub techno, minimal, acid, DnB…), mood, vocals/instrumental and energy. It can copy your tracks into a neatly organized folder tree, export a CSV, and optionally write tags into the files' *Comment* field so rekordbox can use them in intelligent playlists.
 
 ## Setup (Windows → WSL2)
 
-Essentia gira solo su Linux/macOS, quindi su Windows si usa WSL2 (Ubuntu).
+Essentia only runs on Linux/macOS, so on Windows use WSL2 (Ubuntu).
 
 ```bash
-python3 -m venv ~/.venvs/tagwerk          # se manca ensurepip: --without-pip e poi get-pip.py
-~/.venvs/tagwerk/bin/pip install -e /mnt/c/Users/<tu>/workspace/tagwerk
+python3 -m venv ~/.venvs/tagwerk          # if ensurepip is missing: --without-pip, then get-pip.py
+~/.venvs/tagwerk/bin/pip install -e /mnt/c/Users/<you>/workspace/tagwerk
 ```
 
-Al primo avvio i modelli (~25 MB) vengono scaricati in `~/.cache/tagwerk/models` (cambiabile con `TAGWERK_MODELS`).
+On first run the models (~25 MB) are downloaded to `~/.cache/tagwerk/models` (override with `TAGWERK_MODELS`).
 
-## Uso
+## Usage
 
-La musica su Windows da WSL si trova sotto `/mnt/c/...`.
+From WSL, Windows folders live under `/mnt/c/...`.
 
 ```bash
-# prova su 50 pezzi, solo CSV: i file non vengono toccati
-tagwerk "/mnt/c/Users/<tu>/Music/techno" --limit 50 --csv tagwerk.csv
+# organize a folder (and all its subfolders) into a new folder, by style then BPM range
+tagwerk "/mnt/c/Users/<you>/Music/playlists" --organize "/mnt/c/Users/<you>/Music/Tagwerk"
 
-# tutta la cartella; i pezzi già analizzati non vengono rianalizzati (cache in tagwerk.db)
-tagwerk "/mnt/c/Users/<tu>/Music" --csv tagwerk.csv
+# other layouts: any combination of style, bpm, energy, key, mood, vocals
+tagwerk "/mnt/c/Users/<you>/Music/playlists" --organize ".../By key" --by key,bpm
 
-# scrive i tag nel Comment dei file
-tagwerk "/mnt/c/Users/<tu>/Music" --write-tags
+# review results in a spreadsheet
+tagwerk "/mnt/c/Users/<you>/Music/playlists" --csv tagwerk.csv
+
+# try on a few tracks first
+tagwerk "/mnt/c/Users/<you>/Music/playlists" --limit 20 --organize ".../Test"
 ```
 
-Il CSV usa `;` e la virgola decimale, così l'Excel italiano lo apre direttamente.
+- `--organize` **copies**, it never moves: your original folders stay untouched. Same track in two playlists → copied once. Same filename but a different file → `name (2).mp3`. Running again only copies what's new.
+- Results are cached in `tagwerk.db`: already analyzed tracks are never analyzed again, so switching `--by` layout is instant.
+- The CSV uses `;` and decimal commas so an Italian-locale Excel opens it on double click.
 
-## Tag
+Example output with the default `--by style,bpm` (27 tracks from 9 techno/DnB/house playlists):
 
-Nel Comment viene scritto un blocco come questo, davanti al commento che c'era già (per esempio quello di Mixed In Key), che resta intatto:
+```
+Tagwerk/
+├── Drum n Bass/
+│   └── 170-174 BPM/
+├── Hard Techno/
+│   ├── 140-144 BPM/
+│   └── 145-149 BPM/
+├── House/
+│   └── 120-124 BPM/
+└── Techno/
+    ├── 140-144 BPM/
+    ├── 145-149 BPM/
+    └── 150-154 BPM/
+```
+
+Half-time detections (72 BPM for a 144 techno track, 86 for 172 DnB) are doubled based on the detected style; the rule lives in `fold_bpm` and is applied on read, so tuning it needs no re-analysis.
+
+## Tags
+
+`--write-tags` writes a block like this into the Comment field of the **original** files, in front of whatever was there already (e.g. Mixed In Key), which stays intact:
 
 ```
 tw: #dub-techno #techno #dark E6; 8A - Energy 7
 ```
 
-- **stili**: il primo sempre, il 2° e il 3° solo sopra soglia (`STYLE_MIN` in `tagwerk/tags.py`)
-- **mood**: `#aggressive #chill #happy #dark #vocal` sopra `MOOD_MIN`; il vocabolario si cambia in `MOOD_TAGS`
-- **E1–E10**: energia, derivata dall'arousal
+- **styles**: the first always, 2nd and 3rd only above threshold (`STYLE_MIN` in `tagwerk/tags.py`)
+- **mood**: `#aggressive #chill #happy #dark #vocal` above `MOOD_MIN`; change the vocabulary in `MOOD_TAGS`
+- **E1–E10**: energy, derived from arousal
 
-I tag vengono ricalcolati dalla cache, quindi cambiare soglie o vocabolario e rilanciare con `--write-tags` non richiede di rianalizzare.
+Tags are recomputed from the cache, so changing thresholds or vocabulary and running `--write-tags` again needs no re-analysis.
 
-**rekordbox**: dopo aver scritto i tag, sui pezzi già importati serve tasto destro › *Reload Tag*. Poi puoi creare intelligent playlist con la condizione *Comments contains* `#dub-techno`.
+**rekordbox**: after writing tags, right click › *Reload Tag* on tracks already in the collection. Then build intelligent playlists with *Comments contains* `#dub-techno`.
 
-## Test
+## Tests
 
 ```bash
-python tests/test_tags.py
+python tests/test_tagwerk.py
 ```
 
-## Modelli
+## Models
 
-[Essentia models](https://essentia.upf.edu/models.html) (MTG, Universitat Pompeu Fabra), licenza CC BY-NC-SA 4.0: uso non commerciale.
+[Essentia models](https://essentia.upf.edu/models.html) (MTG, Universitat Pompeu Fabra), licensed CC BY-NC-SA 4.0: non-commercial use only.

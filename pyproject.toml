@@ -1,7 +1,7 @@
 [project]
 name = "tagwerk"
 version = "0.1.0"
-description = "Auto-categorizzazione e tagging di musica elettronica per DJ"
+description = "Automatic categorization, tagging and folder organization of electronic music for DJs"
 requires-python = ">=3.10"
 dependencies = ["essentia-tensorflow", "mutagen", "numpy"]
 

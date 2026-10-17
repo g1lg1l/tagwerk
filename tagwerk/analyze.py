@@ -1,19 +1,19 @@
-"""Analisi audio con Essentia: BPM, key, stile Discogs, mood, voce, arousal/valence."""
+"""Audio analysis with Essentia: BPM, key, Discogs style, mood, vocals, arousal/valence."""
 import json
 import os
 import urllib.request
 from pathlib import Path
 
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")  # zittisce TensorFlow, va settato prima dell'import
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")  # silences TensorFlow, must be set before the import
 
 import essentia  # noqa: E402
 
-essentia.log.infoActive = False  # prima di essentia.standard, che già all'import stampa log
+essentia.log.infoActive = False  # before essentia.standard, which already logs on import
 essentia.log.warningActive = False
 
 import essentia.standard as es  # noqa: E402
 
-from .tags import camelot, fold_bpm  # noqa: E402
+from .tags import camelot  # noqa: E402
 
 MODELS_URL = "https://essentia.upf.edu/models"
 MODELS_DIR = Path(os.environ.get("TAGWERK_MODELS", Path.home() / ".cache" / "tagwerk" / "models"))
@@ -22,7 +22,7 @@ EFFNET = "feature-extractors/discogs-effnet/discogs-effnet-bs64-1"
 MUSICNN = "feature-extractors/musicnn/msd-musicnn-1"
 STYLES = "classification-heads/genre_discogs400/genre_discogs400-discogs-effnet-1"
 DEAM = "classification-heads/deam/deam-msd-musicnn-2"
-# nome -> (modello, classe "positiva"); tutti girano sugli embedding Discogs-EffNet
+# name -> (model, "positive" class); all of them run on Discogs-EffNet embeddings
 HEADS = {
     "aggressive": ("classification-heads/mood_aggressive/mood_aggressive-discogs-effnet-1", "aggressive"),
     "relaxed": ("classification-heads/mood_relaxed/mood_relaxed-discogs-effnet-1", "relaxed"),
@@ -35,12 +35,12 @@ HEADS = {
 
 
 def _fetch(name):
-    """Scarica .pb e .json del modello in cache al primo uso. Ritorna (path .pb, metadati)."""
+    """Downloads the model's .pb and .json into the cache on first use. Returns (.pb path, metadata)."""
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     for ext in ("json", "pb"):
         dest = MODELS_DIR / f"{Path(name).name}.{ext}"
         if not dest.exists():
-            tmp = dest.with_name(dest.name + ".part")  # niente modelli mezzi scaricati se si interrompe
+            tmp = dest.with_name(dest.name + ".part")  # no half-downloaded models if interrupted
             urllib.request.urlretrieve(f"{MODELS_URL}/{name}.{ext}", tmp)
             tmp.rename(dest)
     meta = json.loads((MODELS_DIR / f"{Path(name).name}.json").read_text())
@@ -59,7 +59,7 @@ def _head(name):
 
 
 class Analyzer:
-    """Carica i modelli una volta sola, poi analizza un pezzo alla volta."""
+    """Loads the models once, then analyzes one track at a time."""
 
     def __init__(self):
         pb, meta = _fetch(EFFNET)
@@ -73,21 +73,21 @@ class Analyzer:
             model, classes = _head(name)
             self.heads[key] = (model, classes.index(positive))
         self.rhythm = es.RhythmExtractor2013(method="multifeature")
-        self.key = es.KeyExtractor(profileType="edma")  # profilo pensato per la musica elettronica
-        self.resample = es.Resample(inputSampleRate=44100, outputSampleRate=16000, quality=4)  # come in training
+        self.key = es.KeyExtractor(profileType="edma")  # profile tuned for electronic dance music
+        self.resample = es.Resample(inputSampleRate=44100, outputSampleRate=16000, quality=4)  # as in training
 
     def analyze(self, path):
         audio = es.MonoLoader(filename=str(path), sampleRate=44100)()
         bpm = self.rhythm(audio)[0]
         key, scale, strength = self.key(audio)
         audio16 = self.resample(audio)
-        emb = self.effnet(audio16)  # (frame, 1280)
+        emb = self.effnet(audio16)  # (frames, 1280)
         styles = self.styles(emb).mean(axis=0)
         top = styles.argsort()[::-1][:3]
         valence, arousal = self.deam(self.musicnn(audio16)).mean(axis=0)
         top_styles = [(self.style_names[i], round(float(styles[i]), 3)) for i in top]
         return {
-            "bpm": fold_bpm(round(float(bpm), 1), top_styles),
+            "bpm": round(float(bpm), 1),  # raw detector value; half-time folding happens on read (cli._results)
             "key": f"{key} {scale}",
             "camelot": camelot(key, scale),
             "key_strength": round(float(strength), 2),
@@ -96,5 +96,5 @@ class Analyzer:
             "valence": round(float(valence), 2),
             "arousal": round(float(arousal), 2),
             "duration": round(len(audio) / 44100, 1),
-            "embedding": emb.mean(axis=0),  # per categorie personali e pezzi simili, senza rianalizzare
+            "embedding": emb.mean(axis=0),  # for personal categories and similar tracks, without re-analysis
         }
