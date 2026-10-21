@@ -28,20 +28,20 @@ The easy way: `tagwerk setup` asks which folder to read, where the sorted copies
 tagwerk setup
 ```
 
-Or with flags:
+Or directly: point it at a folder and you get, next to it, a `Tagwerk` folder with every track copied and sorted (style, then mood, then BPM range) plus `tagwerk-report.csv`:
 
 ```bash
-# organize a folder (and all its subfolders) into a new folder: style, then mood, then BPM range
-tagwerk ~/Music/playlists --organize ~/Music/Tagwerk
+# ~/Music/playlists (and all its subfolders) -> ~/Music/Tagwerk
+tagwerk ~/Music/playlists
 
-# other layouts: any combination of style, bpm, energy, key, mood, vocals
+# somewhere else, or another layout: any combination of style, bpm, energy, key, mood, vocals
 tagwerk ~/Music/playlists --organize ~/Music/"By key" --by key,bpm
-
-# review results in a spreadsheet
-tagwerk ~/Music/playlists --csv tagwerk.csv
 
 # try on a few tracks first
 tagwerk ~/Music/playlists --limit 20 --organize ~/Music/Test
+
+# only analyze: no copies, no report
+tagwerk ~/Music/playlists --analyze-only
 ```
 
 - `--organize` **copies**, it never moves your originals. Running it again copies what's new, moves a copy whose folder changed (after `tagwerk edit` or new thresholds) and refreshes a copy whose original changed (e.g. after `--write-tags`). Same name but a different file → `name (2).mp3`.
@@ -71,7 +71,7 @@ Half-time detections (72 BPM for a 144 techno track, 86 for 172 DnB) are doubled
 
 ## Fix it by hand
 
-The analysis is a starting point. `tagwerk edit` corrects it or adds your own tags; edits live in the library database (never lost when a track is re-analyzed) and apply on the next `--write-tags`, `--organize` or `--csv`.
+The analysis is a starting point. `tagwerk edit` corrects it or adds your own tags; edits live in the library database (never lost when a track is re-analyzed) and apply on the next run (copies, report, `--write-tags`).
 
 ```bash
 # wrong style, BPM, key or energy

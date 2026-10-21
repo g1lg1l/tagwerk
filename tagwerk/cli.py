@@ -282,7 +282,7 @@ def export_csv(db, files, out):
             w.writerow(head + [_n(r["bpm"]), r["key"], r["camelot"], track_energy(r), *styles,
                                *(round(r["moods"][m] * 100) for m in MOODS), _n(r["valence"]), _n(r["arousal"]),
                                " ".join(build_tags(r)), ""])
-    print(f"CSV: {out}")
+    print(f"Report: {out}")
 
 
 def summary(db, files):
@@ -439,11 +439,13 @@ def main(argv=None):
         prog="tagwerk", description="Analyze, tag and organize your music (BPM, key, style, mood).",
         epilog="new here? tagwerk setup asks a few questions instead. more: tagwerk edit|similar|dupes --help")
     ap.add_argument("folder", help="folder to analyze (recursive)")
-    ap.add_argument("--organize", metavar="OUT", help="copy analyzed tracks into OUT, sorted into subfolders")
+    ap.add_argument("--organize", metavar="OUT",
+                    help="where the sorted copies and the report go (default: a Tagwerk folder next to FOLDER)")
     ap.add_argument("--by", default=BY,
                     help=f"subfolder levels for --organize, comma separated: {', '.join(LAYOUT)} (default: {BY})")
     ap.add_argument("--db", default=DB, help=f"library database (default: {DB})")
-    ap.add_argument("--csv", help="export results to a CSV file")
+    ap.add_argument("--csv", help="report file (default: OUT/tagwerk-report.csv)")
+    ap.add_argument("--analyze-only", action="store_true", help="just analyze: no copies, no report")
     ap.add_argument("--limit", type=int, help="analyze at most N new tracks (for trying things out)")
     ap.add_argument("--write-tags", action="store_true", help="write tags into the Comment field of the original files")
     a = ap.parse_args(argv)
@@ -451,24 +453,28 @@ def main(argv=None):
     by = a.by.split(",")
     if unknown := [k for k in by if k not in LAYOUT]:
         ap.error(f"unknown --by level(s): {', '.join(unknown)}; choose from {', '.join(LAYOUT)}")
+    src = Path(os.path.abspath(a.folder))
+    base = src if src.is_dir() else src.parent
+    out = None if a.analyze_only else Path(a.organize or base.parent / "Tagwerk").expanduser().resolve()
+    csv_out = a.csv or (out / "tagwerk-report.csv" if out else None)
+    db = open_db(a.db)
     with _working(f"Looking for music in {a.folder}"):
-        files = audio_files(a.folder)
-    if a.organize:
-        out = Path(a.organize).resolve()
-        files = [p for p in files if out not in p.resolve().parents]  # never re-analyze our own copies
+        made = {d for (d,) in db.execute("SELECT dest FROM copies")}
+        # never re-analyze our own copies, wherever they are
+        files = [p for p in audio_files(src)
+                 if str(p.resolve()) not in made and not (out and out in p.resolve().parents)]
     if not files:
         ap.error(f"no audio files in {a.folder}")
-    db = open_db(a.db)
     try:
         analyze_new(db, files, a.limit)
     except KeyboardInterrupt:
         sys.exit("\nStopped. Everything analyzed so far is saved: run the same command again to resume.")
     if a.write_tags:
         write_tags(db, files)
-    if a.organize:
+    if out:
         organize(db, files, out, by)
-    if a.csv:
-        export_csv(db, files, a.csv)
+    if csv_out:
+        export_csv(db, files, csv_out)
     summary(db, files)
 
 

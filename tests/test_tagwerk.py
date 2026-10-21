@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np  # noqa: E402
 
-from tagwerk.cli import _results, edit, find_dupes, open_db, organize, summary  # noqa: E402
+from tagwerk.cli import MOODS, _results, edit, find_dupes, main, open_db, organize, summary  # noqa: E402
 from tagwerk.tags import (apply_manual, build_tags, camelot, compatible, energy, fold_bpm, folder_for,  # noqa: E402
                           merge_comment, tag)
 
@@ -155,6 +155,26 @@ def test_dupes_copied_once():
         out = tmp / "out"
         organize(db, [mp3, flac, other], out, ["style"])
         assert sorted(f.name for f in (out / "Techno").iterdir()) == ["other.mp3", "track.flac"]
+
+
+def test_main_defaults_to_copies_and_report():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        db_path = str(tmp / "t.db")
+        p = tmp / "lib" / "playlists" / "a" / "track.mp3"
+        p.parent.mkdir(parents=True)
+        p.write_bytes(b"x")
+        r = {"styles": [("Electronic---Techno", 0.9)], "bpm": 140.0, "duration": 300.0, "key": "A minor",
+             "camelot": "8A", "arousal": 5.0, "valence": 5.0, "moods": dict.fromkeys(MOODS, 0.0)}
+        db = open_db(db_path)
+        db.execute("INSERT INTO tracks VALUES (?, ?, ?, NULL, NULL)", (str(p), p.stat().st_mtime, json.dumps(r)))
+        db.commit()
+        main([str(tmp / "lib" / "playlists"), "--db", db_path])  # no flags: copies + report next to the folder
+        out = tmp / "lib" / "Tagwerk"
+        assert (out / "Techno" / "Neutral" / "140-144 BPM" / "track.mp3").exists()
+        assert "track.mp3" in (out / "tagwerk-report.csv").read_text(encoding="utf-8-sig")
+        # scanning the parent now also finds our copies: they're skipped, not analyzed (no Essentia here)
+        main([str(tmp / "lib"), "--db", db_path, "--analyze-only"])
 
 
 def test_compatible():
