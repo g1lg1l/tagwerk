@@ -19,8 +19,8 @@ from pathlib import Path
 import mutagen
 import numpy as np
 
-from .tags import (DUPE_MIN, KEY_RE, LAYOUT, LEARN_EXAMPLES, LEARN_MIN, apply_manual, build_tags, compatible,
-                   fold_bpm, folder_for, tag, track_energy, update_comment)
+from .tags import (DUPE_MIN, KEY_RE, LAYOUT, LEARN_EXAMPLES, LEARN_MIN, apply_manual, build_tags, clean_filename,
+                   clean_title, compatible, fold_bpm, folder_for, tag, track_energy, update_comment)
 
 AUDIO_EXT = {".mp3", ".wav", ".aiff", ".aif", ".flac", ".m4a", ".ogg"}
 MOODS = ("aggressive", "relaxed", "happy", "sad", "party", "danceable", "voice")  # same keys as analyze.HEADS
@@ -202,12 +202,29 @@ def find_dupes(db, files):
     return [sorted(g, key=lambda p: -p.stat().st_size) for g in groups.values() if len(g) > 1]
 
 
-def _place(d, p):
-    """Where p's copy goes in d: its own name, or 'name (2)' if a different file already has it."""
-    dest, n = d / p.name, 2
-    while dest.exists() and dest.stat().st_size != p.stat().st_size:
-        dest, n = d / f"{p.stem} ({n}){p.suffix}", n + 1  # never overwrite
+def _place(d, p, old):
+    """Where p's copy goes in d: its cleaned name, or 'name (2)' if a different file already has it.
+    old (our previous copy) counts as free, so a copy already in the right place stays put."""
+    name = Path(clean_filename(p))
+    dest, n = d / name, 2
+    while dest.exists() and dest != old and dest.stat().st_size != p.stat().st_size:
+        dest, n = d / f"{name.stem} ({n}){name.suffix}", n + 1  # never overwrite
     return dest
+
+
+def _fresh_copy(p, dest):
+    """Copies p to dest, then cleans the title tag of the copy (never the original's). The copy keeps p's mtime:
+    that's how the next run tells whether the original changed."""
+    shutil.copy2(p, dest)
+    try:
+        f = mutagen.File(dest, easy=True)
+        if f is not None and f.get("title") and (title := clean_title(f["title"][0])) != f["title"][0]:
+            f["title"] = title
+            f.save()
+    except Exception:
+        pass  # untaggable copy: it keeps the title it had
+    st = p.stat()
+    os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns))
 
 
 def _prune(folder, out):
@@ -218,31 +235,33 @@ def _prune(folder, out):
         f.rmdir()
 
 
-def organize(db, files, out, by):
-    """Copies (never moves) originals into out/<level1>/<level2>/…. Remembers its copies, so a re-run after an
-    edit moves the copy to its new folder and refreshes it if the original changed (e.g. --write-tags)."""
+def organize(db, files, out, by, compact=False):
+    """Copies (never moves) originals into out/<level1>/<level2>/… (compact: out/<level1 - level2 - …>), with
+    cleaned names. Remembers its copies, so a re-run after an edit moves the copy to its new folder and refreshes
+    it if the original changed (e.g. --write-tags)."""
     skip = {p for g in find_dupes(db, files) for p in g[1:]}
     n = Counter()
     for p, r, _ in _each(_results(db, files), "Organizing"):
         if not r or p in skip:
             continue  # not analyzed yet (--limit), unreadable, or a duplicate of a better copy
-        d = out.joinpath(*folder_for(r, by))
+        levels = folder_for(r, by)
+        d = out / " - ".join(levels) if compact else out.joinpath(*levels)
         d.mkdir(parents=True, exist_ok=True)
         mine = [Path(x) for (x,) in db.execute("SELECT dest FROM copies WHERE src = ?", (str(p),))]
         old = next((x for x in mine if x.is_relative_to(out) and x.exists()), None)
-        moved = old and old.parent != d  # its folder changed since last time (an edit, new thresholds)
-        dest = old if old and not moved else _place(d, p)
+        dest = _place(d, p, old)
+        moved = old and old != dest  # new folder (an edit, new layout) or new name (cleaning)
         if moved:
             old.unlink() if dest.exists() else old.rename(dest)
             db.execute("DELETE FROM copies WHERE dest = ?", (str(old),))
             _prune(old.parent, out)
-            n["moved"] += 1
+            n["moved or renamed"] += 1
         if not dest.exists():
-            shutil.copy2(p, dest)
+            _fresh_copy(p, dest)
             n["copied"] += 1
         elif abs(dest.stat().st_mtime - p.stat().st_mtime) > 2:  # copy2 keeps mtime (FAT/exFAT: to 2 s), so the
             # original changed since (e.g. --write-tags)
-            shutil.copy2(p, dest)
+            _fresh_copy(p, dest)
             n["updated"] += 1
         elif not moved:
             n["already there"] += 1
@@ -419,8 +438,11 @@ def setup(argv):
             by = PRESETS[by][1] if by in PRESETS else by
             if all(k in LAYOUT for k in by.split(",")):
                 break
+        compact = ask("Compact: one folder per combination (Techno - Dark - 140-144 BPM) instead of nested? y/n",
+                      "n").lower().startswith("y")
         tags = ask("Also write tags into the files' Comment field (for rekordbox)? y/n", "n").lower().startswith("y")
-        cmd = [str(src), "--organize", str(out.expanduser()), "--by", by] + ["--write-tags"] * tags
+        cmd = [str(src), "--organize", str(out.expanduser()), "--by", by] + ["--compact"] * compact
+        cmd += ["--write-tags"] * tags
         print(f"\nYour command, run it again any time to update:\n  tagwerk {shlex.join(cmd)}\n")
         if ask("Run it now? y/n", "y").lower().startswith("y"):
             main(cmd)
@@ -443,6 +465,8 @@ def main(argv=None):
                     help="where the sorted copies and the report go (default: a Tagwerk folder next to FOLDER)")
     ap.add_argument("--by", default=BY,
                     help=f"subfolder levels for --organize, comma separated: {', '.join(LAYOUT)} (default: {BY})")
+    ap.add_argument("--compact", action="store_true",
+                    help="one folder per combination (Techno - Dark - 140-144 BPM) instead of nested folders")
     ap.add_argument("--db", default=DB, help=f"library database (default: {DB})")
     ap.add_argument("--csv", help="report file (default: OUT/tagwerk-report.csv)")
     ap.add_argument("--analyze-only", action="store_true", help="just analyze: no copies, no report")
@@ -472,7 +496,7 @@ def main(argv=None):
     if a.write_tags:
         write_tags(db, files)
     if out:
-        organize(db, files, out, by)
+        organize(db, files, out, by, a.compact)
     if csv_out:
         export_csv(db, files, csv_out)
     summary(db, files)

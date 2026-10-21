@@ -118,6 +118,35 @@ LAYOUT = {
 _UNSAFE = re.compile(r'[<>:"/\\|?*]')  # characters not allowed in Windows folder names
 
 
+# ponytail: pattern list, add to it when new dirt shows up in your library
+_JUNK = (r"free\s*(?:download|dl)|free|download|premiere|out\s*now|official(?:\s*(?:music\s*)?(?:video|audio))?"
+         r"|music\s*video|lyrics?|visuali[sz]er|hq|hd|4k|\d{3}\s*kbps|320|exclusive|preview|buy\s*=?\s*free")
+_STRONG = r"free\s*(?:download|dl)|premiere|out\s*now|official\s*(?:video|audio)"  # junk even outside brackets
+_DIRT = [
+    # track numbers: "22. ", "01 - ", "1-02 ", "01 "; a number that's part of the name ("808 State") stays
+    (re.compile(r"^\s*(?:\d{1,3}\s*[.)_\-–]+\s*)*(?:0\d\s+)?"), ""),
+    (re.compile(rf"[\[(][^\])]*?\b(?:{_JUNK})\b[^\])]*[\])]", re.I), ""),  # "(Free Download)", "[OUT NOW on X]", "[HQ]"
+    (re.compile(rf"^\s*(?:{_STRONG})\s*[:|\-–]\s*", re.I), ""),  # "PREMIERE: ", "FREE DL | "
+    (re.compile(rf"\s*[|\-–]\s*(?:{_STRONG})\b.*$", re.I), ""),  # " | Free Download", " - OUT NOW on X"
+    (re.compile(r"\s*\[[A-Za-z0-9_-]{11}\]$"), ""),  # yt-dlp's "[video id]"
+    (re.compile(r"[\[(]\s*[\])]"), ""),  # brackets left empty
+    (re.compile(r"\s{2,}"), " "),
+]
+
+
+def clean_title(s):
+    """'22. Artist - Track (Free Download) [HQ]' -> 'Artist - Track'. Mix names, remixes and labels stay."""
+    out = s.replace("_", " ")
+    for pattern, repl in _DIRT:
+        out = pattern.sub(repl, out)
+    return out.strip(" -–|.") or s  # nothing left: better dirty than empty
+
+
+def clean_filename(p):
+    """Clean title, safe on Windows, same extension."""
+    return _UNSAFE.sub("-", clean_title(p.stem)).strip(" .") + p.suffix
+
+
 def folder_for(r, by):
     """E.g. by=('style', 'bpm') -> ['Hard Techno', '145-149 BPM']."""
     return [_UNSAFE.sub("-", LAYOUT[k](r)).strip(" .") for k in by]

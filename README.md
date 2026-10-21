@@ -40,11 +40,15 @@ tagwerk ~/Music/playlists --organize ~/Music/"By key" --by key,bpm
 # try on a few tracks first
 tagwerk ~/Music/playlists --limit 20 --organize ~/Music/Test
 
+# one folder per combination instead of a nested tree: Techno - Dark - 140-144 BPM/
+tagwerk ~/Music/playlists --compact
+
 # only analyze: no copies, no report
 tagwerk ~/Music/playlists --analyze-only
 ```
 
 - `--organize` **copies**, it never moves your originals. Running it again copies what's new, moves a copy whose folder changed (after `tagwerk edit` or new thresholds) and refreshes a copy whose original changed (e.g. after `--write-tags`). Same name but a different file → `name (2).mp3`.
+- **Clean names**: copies drop the usual dirt from file names and from the title tag: track numbers (`22. `, `01 - `), `(Free Download)`, `[FREE DL]`, `PREMIERE:`, `| OUT NOW on …`, `(Official Video)`, `[HQ]`, `[320]`, yt-dlp video ids, underscores. Remixes, mix names and labels stay. Originals keep their names; patterns live in `_DIRT` in `tagwerk/tags.py`.
 - **Duplicates**: the same track saved twice (another format, bitrate or name) is copied once, the biggest file wins. `tagwerk dupes ~/Music/playlists` lists them; nothing is ever deleted.
 - Progress shows time left; Ctrl‑C stops cleanly and the next run picks up where it left off. Each run ends with a quick overview of your library's styles.
 - Everything lives in one library database, `~/.tagwerk/tagwerk.db` (override with `TAGWERK_HOME` or `--db`): analysis, your edits and which copies tagwerk made. Already analyzed tracks are never analyzed again, so switching `--by` layout is instant. Upgrading from 0.2 or older? Move your old `tagwerk.db` there.

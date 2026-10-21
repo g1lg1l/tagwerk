@@ -10,8 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np  # noqa: E402
 
 from tagwerk.cli import MOODS, _results, edit, find_dupes, main, open_db, organize, summary  # noqa: E402
-from tagwerk.tags import (apply_manual, build_tags, camelot, compatible, energy, fold_bpm, folder_for,  # noqa: E402
-                          merge_comment, tag)
+from tagwerk.tags import (apply_manual, build_tags, camelot, clean_filename, clean_title, compatible,  # noqa: E402
+                          energy, fold_bpm, folder_for, merge_comment, tag)
 
 
 def test_camelot():
@@ -143,6 +143,19 @@ def test_organize_follows_edits_and_updates():
         assert p.read_bytes() == b"v2 with tags"  # original untouched
 
 
+def test_organize_clean_names_and_compact():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        db, (p,) = _library(tmp, {"a/07. Artist - Track (Free Download).mp3": (b"x", [1, 0], "Techno")})
+        out = tmp / "out"
+        organize(db, [p], out, ["style", "bpm"])
+        assert [str(f.relative_to(out)) for f in out.rglob("*.mp3")] == ["Techno/140-144 BPM/Artist - Track.mp3"]
+        organize(db, [p], out, ["style", "bpm"], compact=True)  # switching layout moves the copy, no leftovers
+        assert [str(f.relative_to(out)) for f in out.rglob("*")] == ["Techno - 140-144 BPM",
+                                                                    "Techno - 140-144 BPM/Artist - Track.mp3"]
+        assert p.exists() and p.name.startswith("07. ")  # original untouched
+
+
 def test_dupes_copied_once():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -175,6 +188,32 @@ def test_main_defaults_to_copies_and_report():
         assert "track.mp3" in (out / "tagwerk-report.csv").read_text(encoding="utf-8-sig")
         # scanning the parent now also finds our copies: they're skipped, not analyzed (no Essentia here)
         main([str(tmp / "lib"), "--db", db_path, "--analyze-only"])
+
+
+def test_clean_title():
+    cases = {
+        "22. Artist - Track": "Artist - Track",
+        "01 - Artist - Track": "Artist - Track",
+        "1-02 Artist - Track": "Artist - Track",
+        "07_Artist_-_Track": "Artist - Track",
+        "01 Artist - Track": "Artist - Track",
+        "Artist - Track (Free Download)": "Artist - Track",
+        "Artist - Track [FREE DL] [320]": "Artist - Track",
+        "PREMIERE: Artist - Track (Original Mix)": "Artist - Track (Original Mix)",
+        "Premiere | Artist - Track [Mord]": "Artist - Track [Mord]",
+        "Artist - Track | FREE DOWNLOAD": "Artist - Track",
+        "Artist - Track - OUT NOW on Drumcode": "Artist - Track",
+        "Artist - Track (Official Video) [HD]": "Artist - Track",
+        "Artist - Track (Dax J Remix) [OUT NOW]": "Artist - Track (Dax J Remix)",
+        "Artist - Track [dQw4w9WgXcQ]": "Artist - Track",
+        "808 State - Pacific State": "808 State - Pacific State",  # a number that is the name stays
+        "2 Unlimited - No Limit": "2 Unlimited - No Limit",
+        "Freedom - Downloaded Dreams": "Freedom - Downloaded Dreams",  # words, not junk
+        "(Free Download)": "(Free Download)",  # nothing left: keep it
+    }
+    for dirty, clean in cases.items():
+        assert clean_title(dirty) == clean, (dirty, clean_title(dirty))
+    assert clean_filename(Path("03. Artist - A:B? (Free DL).mp3")) == "Artist - A-B-.mp3"
 
 
 def test_compatible():
