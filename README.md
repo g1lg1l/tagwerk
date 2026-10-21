@@ -4,41 +4,53 @@
 
 Analyzes your music locally and tags it on its own: BPM, key (Camelot), Discogs style (techno, dub techno, minimal, acid, DnB…), mood, vocals/instrumental and energy. It can copy your tracks into a neatly organized folder tree, export a CSV, and optionally write tags into the files' *Comment* field so rekordbox can use them in intelligent playlists.
 
-## Setup (Windows → WSL2)
+## Install
 
-Essentia only runs on Linux/macOS, so on Windows use WSL2 (Ubuntu).
+tagwerk is a command-line tool: install it once and the `tagwerk` command works from any folder.
+
+**macOS** (Apple Silicon or Intel), with [uv](https://docs.astral.sh/uv/):
 
 ```bash
-python3 -m venv ~/.venvs/tagwerk          # if ensurepip is missing: --without-pip, then get-pip.py
-~/.venvs/tagwerk/bin/pip install -e /mnt/c/Users/<you>/workspace/tagwerk
+uv tool install --python 3.12 git+https://github.com/g1lg1l/tagwerk
 ```
+
+From a local clone, `uv tool install --python 3.12 -e .` instead, so your code changes apply without reinstalling.
+
+**Windows**: Essentia doesn't run on Windows itself, so use WSL2 (Ubuntu) and the same command there. Windows folders live under `/mnt/c/...`.
 
 On first run the models (~25 MB) are downloaded to `~/.cache/tagwerk/models` (override with `TAGWERK_MODELS`).
 
 ## Usage
 
-From WSL, Windows folders live under `/mnt/c/...`.
+The easy way: `tagwerk setup` asks which folder to read, where the sorted copies go, which layout and whether to write tags, then shows the command it built and runs it. Run that same command again whenever you add music.
 
 ```bash
-# organize a folder (and all its subfolders) into a new folder, by style then BPM range
-tagwerk "/mnt/c/Users/<you>/Music/playlists" --organize "/mnt/c/Users/<you>/Music/Tagwerk"
-
-# other layouts: any combination of style, bpm, energy, key, mood, vocals
-tagwerk "/mnt/c/Users/<you>/Music/playlists" --organize ".../By key" --by key,bpm
-
-# review results in a spreadsheet
-tagwerk "/mnt/c/Users/<you>/Music/playlists" --csv tagwerk.csv
-
-# try on a few tracks first
-tagwerk "/mnt/c/Users/<you>/Music/playlists" --limit 20 --organize ".../Test"
+tagwerk setup
 ```
 
-- `--organize` **copies**, it never moves: your original folders stay untouched. Same track in two playlists → copied once. Same filename but a different file → `name (2).mp3`. Running again only copies what's new.
+Or with flags:
+
+```bash
+# organize a folder (and all its subfolders) into a new folder: style, then mood, then BPM range
+tagwerk ~/Music/playlists --organize ~/Music/Tagwerk
+
+# other layouts: any combination of style, bpm, energy, key, mood, vocals
+tagwerk ~/Music/playlists --organize ~/Music/"By key" --by key,bpm
+
+# review results in a spreadsheet
+tagwerk ~/Music/playlists --csv tagwerk.csv
+
+# try on a few tracks first
+tagwerk ~/Music/playlists --limit 20 --organize ~/Music/Test
+```
+
+- `--organize` **copies**, it never moves your originals. Running it again copies what's new, moves a copy whose folder changed (after `tagwerk edit` or new thresholds) and refreshes a copy whose original changed (e.g. after `--write-tags`). Same name but a different file → `name (2).mp3`.
+- **Duplicates**: the same track saved twice (another format, bitrate or name) is copied once, the biggest file wins. `tagwerk dupes ~/Music/playlists` lists them; nothing is ever deleted.
 - Progress shows time left; Ctrl‑C stops cleanly and the next run picks up where it left off. Each run ends with a quick overview of your library's styles.
-- Results are cached in `tagwerk.db`: already analyzed tracks are never analyzed again, so switching `--by` layout is instant.
+- Everything lives in one library database, `~/.tagwerk/tagwerk.db` (override with `TAGWERK_HOME` or `--db`): analysis, your edits and which copies tagwerk made. Already analyzed tracks are never analyzed again, so switching `--by` layout is instant. Upgrading from 0.2 or older? Move your old `tagwerk.db` there.
 - The CSV uses `;` and decimal commas so an Italian-locale Excel opens it on double click.
 
-Example output with the default `--by style,bpm` (27 tracks from 9 techno/DnB/house playlists):
+Example output with `--by style,bpm` (27 tracks from 9 techno/DnB/house playlists):
 
 ```
 Tagwerk/
@@ -59,7 +71,7 @@ Half-time detections (72 BPM for a 144 techno track, 86 for 172 DnB) are doubled
 
 ## Fix it by hand
 
-The analysis is a starting point. `tagwerk edit` corrects it or adds your own tags; edits live in `tagwerk.db` (never lost when a track is re-analyzed) and apply on the next `--write-tags`, `--organize` or `--csv`.
+The analysis is a starting point. `tagwerk edit` corrects it or adds your own tags; edits live in the library database (never lost when a track is re-analyzed) and apply on the next `--write-tags`, `--organize` or `--csv`.
 
 ```bash
 # wrong style, BPM, key or energy
@@ -75,8 +87,6 @@ tagwerk edit ".../track.mp3" --reset
 ```
 
 **Tagwerk learns your tags.** Once a tag is on 5+ tracks (`LEARN_EXAMPLES`), every track you haven't hand-tagged gets the hand tags of the most similar track you did (if it's similar enough, `LEARN_MIN`). Wrong guess? `--remove` it on that track: it becomes a "not this" example and its neighbours follow. Thresholds live in `tagwerk/tags.py`.
-
-`--organize` only ever adds copies: after changing a style, delete the output folder and run it again for a clean tree.
 
 ## Similar tracks
 

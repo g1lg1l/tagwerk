@@ -1,32 +1,39 @@
 """tagwerk <folder>: analyzes tracks (cached), organizes copies into subfolders, exports CSV, writes tags on request.
-tagwerk edit <file|folder>: hand corrections and personal tags. tagwerk similar <file>: tracks that sound alike."""
+tagwerk setup: a few questions instead of flags. tagwerk edit <file|folder>: hand corrections and personal tags.
+tagwerk similar <file>: tracks that sound alike. tagwerk dupes <folder>: tracks saved more than once."""
 import argparse
 import csv
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 import sys
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import mutagen
 import numpy as np
 
-from .tags import (KEY_RE, LAYOUT, LEARN_EXAMPLES, LEARN_MIN, apply_manual, build_tags, compatible, fold_bpm, folder_for, tag,
-                   track_energy, update_comment)
+from .tags import (DUPE_MIN, KEY_RE, LAYOUT, LEARN_EXAMPLES, LEARN_MIN, apply_manual, build_tags, compatible,
+                   fold_bpm, folder_for, tag, track_energy, update_comment)
 
 AUDIO_EXT = {".mp3", ".wav", ".aiff", ".aif", ".flac", ".m4a", ".ogg"}
 MOODS = ("aggressive", "relaxed", "happy", "sad", "party", "danceable", "voice")  # same keys as analyze.HEADS
+# one library database wherever you run tagwerk from
+DB = str(Path(os.environ.get("TAGWERK_HOME", Path.home() / ".tagwerk")) / "tagwerk.db")
+BY = "style,mood,bpm"
 
 
 def open_db(path):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path)
     db.execute("CREATE TABLE IF NOT EXISTS tracks"
                " (path TEXT PRIMARY KEY, mtime REAL, data TEXT, embedding BLOB, error TEXT)")
     # hand edits live apart from the analysis: re-analyzing a track never loses them
     db.execute("CREATE TABLE IF NOT EXISTS manual (path TEXT PRIMARY KEY, data TEXT)")
+    db.execute("CREATE TABLE IF NOT EXISTS copies (dest TEXT PRIMARY KEY, src TEXT)")  # what --organize made
     return db
 
 
@@ -127,23 +134,82 @@ def write_tags(db, files):
         print(f"{p.name}: {' '.join(tags)}")
 
 
+def find_dupes(db, files):
+    """The same track saved more than once (another format, bitrate or name): near-identical sound and length.
+    Groups of paths, the one to keep first: the biggest file, i.e. the best quality at that length."""
+    emb = _embeddings(db)
+    res = [(p, r) for p, r, _ in _results(db, files) if r and str(p) in emb]
+    buckets = defaultdict(list)  # by whole seconds: only tracks of about the same length get compared
+    for i, (_, r) in enumerate(res):
+        buckets[int(r["duration"])].append(i)
+    parent = list(range(len(res)))
+
+    def root(i):
+        while parent[i] != i:
+            i = parent[i]
+        return i
+
+    for i, (p, r) in enumerate(res):
+        for j in (j for b in (-1, 0, 1) for j in buckets[int(r["duration"]) + b] if j > i):
+            q, rq = res[j]
+            if abs(rq["duration"] - r["duration"]) <= 1 and emb[str(p)] @ emb[str(q)] >= DUPE_MIN:
+                parent[root(j)] = root(i)
+    groups = defaultdict(list)
+    for i, (p, _) in enumerate(res):
+        groups[root(i)].append(p)
+    return [sorted(g, key=lambda p: -p.stat().st_size) for g in groups.values() if len(g) > 1]
+
+
+def _place(d, p):
+    """Where p's copy goes in d: its own name, or 'name (2)' if a different file already has it."""
+    dest, n = d / p.name, 2
+    while dest.exists() and dest.stat().st_size != p.stat().st_size:
+        dest, n = d / f"{p.stem} ({n}){p.suffix}", n + 1  # never overwrite
+    return dest
+
+
+def _prune(folder, out):
+    """Removes folders a move left empty, up to out."""
+    for f in [folder, *folder.parents]:
+        if f == out or not f.is_relative_to(out) or any(f.iterdir()):
+            return
+        f.rmdir()
+
+
 def organize(db, files, out, by):
-    """Copies (never moves) every analyzed track to out/<level1>/<level2>/…; the originals stay where they are."""
-    copied = skipped = 0
+    """Copies (never moves) originals into out/<level1>/<level2>/…. Remembers its copies, so a re-run after an
+    edit moves the copy to its new folder and refreshes it if the original changed (e.g. --write-tags)."""
+    skip = {p for g in find_dupes(db, files) for p in g[1:]}
+    n = Counter()
     for p, r, _ in _results(db, files):
-        if not r:
-            continue  # not analyzed yet (--limit) or unreadable
+        if not r or p in skip:
+            continue  # not analyzed yet (--limit), unreadable, or a duplicate of a better copy
         d = out.joinpath(*folder_for(r, by))
         d.mkdir(parents=True, exist_ok=True)
-        dest, n = d / p.name, 2
-        while dest.exists() and dest.stat().st_size != p.stat().st_size:
-            dest, n = d / f"{p.stem} ({n}){p.suffix}", n + 1  # same name, different file: never overwrite
-        if dest.exists():
-            skipped += 1  # already copied on a previous run, or the same track sits in two playlists
-            continue
-        shutil.copy2(p, dest)
-        copied += 1
-    print(f"Organized into {out}: {copied} copied, {skipped} already there")
+        mine = [Path(x) for (x,) in db.execute("SELECT dest FROM copies WHERE src = ?", (str(p),))]
+        old = next((x for x in mine if x.is_relative_to(out) and x.exists()), None)
+        moved = old and old.parent != d  # its folder changed since last time (an edit, new thresholds)
+        dest = old if old and not moved else _place(d, p)
+        if moved:
+            old.unlink() if dest.exists() else old.rename(dest)
+            db.execute("DELETE FROM copies WHERE dest = ?", (str(old),))
+            _prune(old.parent, out)
+            n["moved"] += 1
+        if not dest.exists():
+            shutil.copy2(p, dest)
+            n["copied"] += 1
+        elif abs(dest.stat().st_mtime - p.stat().st_mtime) > 2:  # copy2 keeps mtime (FAT/exFAT: to 2 s), so the
+            # original changed since (e.g. --write-tags)
+            shutil.copy2(p, dest)
+            n["updated"] += 1
+        elif not moved:
+            n["already there"] += 1
+        db.execute("REPLACE INTO copies VALUES (?, ?)", (str(dest), str(p)))
+    db.commit()
+    n["duplicates skipped"] = len(skip)
+    print(f"Organized into {out}: {', '.join(f'{v} {k}' for k, v in n.items() if v) or 'nothing to do'}")
+    if skip:
+        print("  tagwerk dupes <folder> lists the duplicates")
 
 
 def _artist_title(p):
@@ -214,7 +280,7 @@ def edit(argv):
     ap.add_argument("--remove", nargs="+", action="extend", default=[], metavar="TAG",
                     help="drop a tag, also one tagwerk found or learned")
     ap.add_argument("--reset", action="store_true", help="forget all hand edits on these tracks first")
-    ap.add_argument("--db", default="tagwerk.db")
+    ap.add_argument("--db", default=DB)
     a = ap.parse_args(argv)
     a.key = a.key and a.key.upper()
     if a.key and not KEY_RE.match(a.key):
@@ -253,7 +319,7 @@ def similar(argv):
     ap = argparse.ArgumentParser(prog="tagwerk similar", description="Tracks that sound most like FILE (#12).")
     ap.add_argument("file")
     ap.add_argument("-n", type=int, default=10, help="how many (default: 10)")
-    ap.add_argument("--db", default="tagwerk.db")
+    ap.add_argument("--db", default=DB)
     a = ap.parse_args(argv)
     db = open_db(a.db)
     emb, me = _embeddings(db), os.path.abspath(a.file)
@@ -272,24 +338,73 @@ def similar(argv):
         print(f"  {sims[i]:.2f} {'✓' if ok else ' '} {r['bpm']:>5.1f} {r['camelot']:>3}  {style[:18]:<18} {p.name}")
 
 
-COMMANDS = {"edit": edit, "similar": similar}
+def dupes(argv):
+    ap = argparse.ArgumentParser(prog="tagwerk dupes", description="Tracks saved more than once (another format, "
+                                 "bitrate or name). --organize copies only the first of each group.")
+    ap.add_argument("folder")
+    ap.add_argument("--db", default=DB)
+    a = ap.parse_args(argv)
+    groups = find_dupes(open_db(a.db), audio_files(a.folder))
+    for g in groups:
+        print(g[0].name)
+        for i, p in enumerate(g):
+            print(f"  {'keep' if i == 0 else 'skip'}  {p.stat().st_size / 1e6:6.1f} MB  {p}")
+    n = len(groups)
+    print(f"{n} track{'s' * (n > 1)} saved more than once" if n else "No duplicates among the analyzed tracks.")
 
 
-def main():
-    if len(sys.argv) > 1 and sys.argv[1] in COMMANDS and not Path(sys.argv[1]).exists():
-        return COMMANDS[sys.argv[1]](sys.argv[2:])
+PRESETS = {"1": ("Style › Mood › BPM", BY), "2": ("Style › BPM", "style,bpm"), "3": ("Mood › BPM", "mood,bpm"),
+           "4": ("Key › BPM", "key,bpm"), "5": ("Energy › Style", "energy,style")}
+
+
+def setup(argv):
+    """A few questions instead of flags. Ends with the command it built: re-run that to update."""
+    argparse.ArgumentParser(prog="tagwerk setup", description=setup.__doc__).parse_args(argv)
+
+    def ask(question, default):
+        return input(f"{question} [{default}]: ").strip() or default
+
+    try:
+        while not (files := audio_files(src := Path(ask("Music folder to read", "~/Music")).expanduser())):
+            print(f"  no audio files in {src}")
+        print(f"  {len(files)} tracks")
+        out = Path(ask("Where should the sorted copies go? Originals are never moved", src.parent / "Tagwerk"))
+        print("Folder layout:")
+        for k, (name, _) in PRESETS.items():
+            print(f"  {k}. {name}")
+        while True:
+            by = ask(f"Pick one, or type levels like key,energy ({', '.join(LAYOUT)})", "1").replace(" ", "")
+            by = PRESETS[by][1] if by in PRESETS else by
+            if all(k in LAYOUT for k in by.split(",")):
+                break
+        tags = ask("Also write tags into the files' Comment field (for rekordbox)? y/n", "n").lower().startswith("y")
+        cmd = [str(src), "--organize", str(out.expanduser()), "--by", by] + ["--write-tags"] * tags
+        print(f"\nYour command, run it again any time to update:\n  tagwerk {shlex.join(cmd)}\n")
+        if ask("Run it now? y/n", "y").lower().startswith("y"):
+            main(cmd)
+    except (KeyboardInterrupt, EOFError):
+        print()
+
+
+COMMANDS = {"setup": setup, "edit": edit, "similar": similar, "dupes": dupes}
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in COMMANDS and not Path(argv[0]).exists():
+        return COMMANDS[argv[0]](argv[1:])
     ap = argparse.ArgumentParser(
         prog="tagwerk", description="Analyze, tag and organize your music (BPM, key, style, mood).",
-        epilog="more: tagwerk edit --help (fix results, tag by hand) · tagwerk similar --help (tracks alike)")
+        epilog="new here? tagwerk setup asks a few questions instead. more: tagwerk edit|similar|dupes --help")
     ap.add_argument("folder", help="folder to analyze (recursive)")
     ap.add_argument("--organize", metavar="OUT", help="copy analyzed tracks into OUT, sorted into subfolders")
-    ap.add_argument("--by", default="style,bpm",
-                    help=f"subfolder levels for --organize, comma separated: {', '.join(LAYOUT)} (default: style,bpm)")
-    ap.add_argument("--db", default="tagwerk.db", help="results cache (default: tagwerk.db)")
+    ap.add_argument("--by", default=BY,
+                    help=f"subfolder levels for --organize, comma separated: {', '.join(LAYOUT)} (default: {BY})")
+    ap.add_argument("--db", default=DB, help=f"library database (default: {DB})")
     ap.add_argument("--csv", help="export results to a CSV file")
     ap.add_argument("--limit", type=int, help="analyze at most N new tracks (for trying things out)")
     ap.add_argument("--write-tags", action="store_true", help="write tags into the Comment field of the original files")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
 
     by = a.by.split(",")
     if unknown := [k for k in by if k not in LAYOUT]:

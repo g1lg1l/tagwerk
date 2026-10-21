@@ -9,6 +9,8 @@ MOOD_MIN = 0.5
 # ponytail: absolute cosine floor for learned tags, calibrate on a real library (#9)
 LEARN_MIN = 0.9  # a track inherits hand tags only from a hand-tagged track at least this similar
 LEARN_EXAMPLES = 5  # a hand tag spreads to other tracks only once you've put it on this many
+# ponytail: guessed, calibrate on real duplicates (#9)
+DUPE_MIN = 0.995  # about the same length and at least this similar = the same track saved twice
 # model name -> tag; change the vocabulary freely
 MOOD_TAGS = {"aggressive": "aggressive", "relaxed": "chill", "happy": "happy", "sad": "dark", "voice": "vocal"}
 

@@ -1,5 +1,6 @@
 """Tests that need no Essentia (tags, folder layout, organize). Run with: python tests/test_tagwerk.py"""
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -8,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np  # noqa: E402
 
-from tagwerk.cli import _results, edit, open_db, organize, summary  # noqa: E402
+from tagwerk.cli import _results, edit, find_dupes, open_db, organize, summary  # noqa: E402
 from tagwerk.tags import (apply_manual, build_tags, camelot, compatible, energy, fold_bpm, folder_for,  # noqa: E402
                           merge_comment, tag)
 
@@ -106,6 +107,54 @@ def test_organize_copies_without_overwriting():
             assert (dest / "track.mp3").read_bytes() == b"same"
             assert (dest / "track (2).mp3").read_bytes() == b"different!"
         assert all(p.exists() for p in paths)  # originals untouched
+
+
+def _library(tmp, tracks):
+    """tracks: {relative path: (bytes, embedding, style)} -> (db, paths), all analyzed."""
+    db, paths = open_db(":memory:"), []
+    for name, (data, vec, style) in tracks.items():
+        p = tmp / "in" / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        r = {"styles": [(f"Electronic---{style}", 0.9)], "bpm": 140.0, "duration": 300.0}
+        db.execute("INSERT INTO tracks VALUES (?, 0, ?, ?, NULL)",
+                   (str(p), json.dumps(r), np.array(vec, np.float32).tobytes()))
+        paths.append(p)
+    return db, paths
+
+
+def test_organize_follows_edits_and_updates():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        db, (p,) = _library(tmp, {"a/track.mp3": (b"v1", [1, 0], "Techno")})
+        out = tmp / "out"
+        organize(db, [p], out, ["style", "bpm"])
+        assert (out / "Techno" / "140-144 BPM" / "track.mp3").exists()
+
+        db.execute("INSERT INTO manual VALUES (?, ?)", (str(p), json.dumps({"style": "House"})))
+        organize(db, [p], out, ["style", "bpm"])  # the copy follows the edit, the empty folders go
+        assert [str(f.relative_to(out)) for f in out.rglob("*.mp3")] == ["House/140-144 BPM/track.mp3"]
+        assert not (out / "Techno").exists()
+
+        p.write_bytes(b"v2 with tags")  # e.g. --write-tags changed the original
+        os.utime(p, (p.stat().st_atime, p.stat().st_mtime + 10))
+        organize(db, [p], out, ["style", "bpm"])
+        assert (out / "House" / "140-144 BPM" / "track.mp3").read_bytes() == b"v2 with tags"
+        assert p.read_bytes() == b"v2 with tags"  # original untouched
+
+
+def test_dupes_copied_once():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        db, (mp3, flac, other) = _library(tmp, {
+            "a/track.mp3": (b"x" * 10, [1, 0], "Techno"),
+            "b/track.flac": (b"x" * 30, [1, 0.001], "Techno"),  # same track, better file
+            "c/other.mp3": (b"y" * 10, [0, 1], "Techno"),
+        })
+        assert find_dupes(db, [mp3, flac, other]) == [[flac, mp3]]
+        out = tmp / "out"
+        organize(db, [mp3, flac, other], out, ["style"])
+        assert sorted(f.name for f in (out / "Techno").iterdir()) == ["other.mp3", "track.flac"]
 
 
 def test_compatible():
