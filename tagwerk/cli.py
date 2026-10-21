@@ -6,6 +6,7 @@ import csv
 import itertools
 import json
 import os
+import re
 import shlex
 import shutil
 import sqlite3
@@ -14,6 +15,7 @@ import threading
 import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import mutagen
@@ -28,6 +30,53 @@ MOODS = ("aggressive", "relaxed", "happy", "sad", "party", "danceable", "voice")
 # one library database wherever you run tagwerk from
 DB = str(Path(os.environ.get("TAGWERK_HOME", Path.home() / ".tagwerk")) / "tagwerk.db")
 BY = "style,mood,bpm"
+
+
+def _version():
+    """pyproject.toml when running from a checkout: an editable install's metadata keeps the version it was
+    installed with."""
+    toml = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    if toml.exists() and (m := re.search(r'^version = "(.+)"', toml.read_text(), re.M)):
+        return m[1]
+    try:
+        return version("tagwerk")
+    except PackageNotFoundError:
+        return "dev"
+
+
+VERSION = _version()
+
+_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")  # https://no-color.org
+BOLD, DIM, RED, GREEN, YELLOW, CYAN = "1", "2", "31", "32", "33", "36"
+
+
+def _c(style, text):
+    return f"\033[{style}m{text}\033[0m" if _COLOR else str(text)
+
+
+def _home(p):
+    """/Users/gil/Music/x -> ~/Music/x: shorter lines."""
+    s, home = str(p), str(Path.home())
+    return "~" + s[len(home):] if s.startswith(home + os.sep) else s
+
+
+def _fit(name, width):
+    return (name if len(name) <= width else name[:width - 1] + "…").ljust(width)
+
+
+@contextmanager
+def _quiet_native():
+    """TensorFlow's C++ side logs (absl, MLIR) straight to file descriptor 2, past every Python setting: mute it
+    while models load and run. Python errors still arrive as exceptions."""
+    sys.stderr.flush()
+    saved = os.dup(2)
+    with open(os.devnull, "w") as null:
+        os.dup2(null.fileno(), 2)
+    try:
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
 
 
 def open_db(path):
@@ -66,7 +115,8 @@ def _working(label):
     def spin():
         start = time.monotonic()
         for c in itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"):
-            print(f"\r\033[K{status[0]} {c} {time.monotonic() - start:.0f}s", end="", flush=True)
+            print(f"\r\033[K{status[0]} {_c(CYAN, c)} {_c(DIM, f'{time.monotonic() - start:.0f}s')}", end="",
+                  flush=True)
             if stop.wait(0.1):
                 break
 
@@ -96,7 +146,7 @@ def _add_themes(db):
                      " AND json_extract(data, '$.themes') IS NULL").fetchall()
     if not old:
         return
-    with _working(f"Adding moods to {len(old)} tracks from the cache"):
+    with _working(f"Adding moods to {len(old)} tracks from the cache"), _quiet_native():
         from .analyze import theme_model
         themes = theme_model()
         for p, b in old:
@@ -109,28 +159,32 @@ def analyze_new(db, files, limit=None):
     """Analyzes only new or modified files; a broken file is logged and retried only if it changes."""
     cached = dict(db.execute("SELECT path, mtime FROM tracks"))
     todo = [p for p in files if cached.get(str(p)) != p.stat().st_mtime][:limit]
-    print(f"{len(files)} files, {len(files) - len(todo)} already analyzed, {len(todo)} to analyze")
+    cached = len(files) - len(todo)
+    print(f"{_c(BOLD, len(files))} tracks · {cached} already analyzed · {_c(BOLD, len(todo))} to analyze")
     _add_themes(db)
     if not todo:
         return
-    with _working("Loading models (the first run also downloads them, ~25 MB)"):
+    with _working("Loading models (the first run also downloads them, ~30 MB)"), _quiet_native():
         from .analyze import Analyzer  # heavy import (TensorFlow): only when needed
         analyzer = Analyzer()
-    start = time.monotonic()
+    start, width, digits = time.monotonic(), min(40, max(len(p.name) for p in todo)), len(str(len(todo)))
     for i, p in enumerate(todo, 1):
         left = (time.monotonic() - start) / (i - 1) * (len(todo) - i + 1) if i > 1 else 0
-        prefix = f"[{i}/{len(todo)}{f' · {_duration(left)} left' if left else ''}] {p.name}"
+        count = _c(DIM, f"{i:>{digits}}/{len(todo)}{f' · {_duration(left)} left' if left else ''}")
+        prefix = f"{count}  {_fit(p.name, width)}"
         try:
-            with _working(prefix):
+            with _working(prefix), _quiet_native():
                 r = analyzer.analyze(p)
             emb = r.pop("embedding").astype(np.float32).tobytes()
             db.execute("REPLACE INTO tracks VALUES (?, ?, ?, ?, NULL)", (str(p), p.stat().st_mtime, json.dumps(r), emb))
-            line = f"→ {fold_bpm(r['bpm'], r['styles'])} {r['camelot']} {' '.join(build_tags(r))}"
+            r = _load(json.dumps(r), {})  # as every other command sees it: half-time fixed, styles relabelled
+            bpm, key, tags = f"{r['bpm']:5.1f}", f"{r['camelot']:>3}", " ".join(build_tags(r))
+            line = f"{_c(BOLD, bpm)} {_c(CYAN, key)}  {_c(DIM, tags)}"
         except Exception as e:
             db.execute("REPLACE INTO tracks VALUES (?, ?, NULL, NULL, ?)", (str(p), p.stat().st_mtime, str(e)))
-            line = f"✗ {e}"
+            line = _c(RED, f"✗ {e}")
         db.commit()
-        print(f"{prefix} {line}")
+        print(f"{prefix}  {line}")
 
 
 def _load(d, manual):
@@ -186,13 +240,13 @@ def write_tags(db, files):
         try:
             update_comment(p, tags)
         except Exception as e:  # e.g. file open in another program
-            print(f"{p.name}: tags not written ({e})", file=sys.stderr)
+            print(_c(RED, f"✗ {p.name}: tags not written ({e})"), file=sys.stderr)
             continue
         # store the new mtime, otherwise next run would see the file as modified and re-analyze it
         db.execute("UPDATE tracks SET data = json_set(data, '$.written', json(?)), mtime = ? WHERE path = ?",
                    (json.dumps(tags), p.stat().st_mtime, str(p)))
         db.commit()
-        print(f"{p.name}: {' '.join(tags)}")
+        print(f"{_c(GREEN, '✎')} {p.name}  {_c(DIM, ' '.join(tags))}")
 
 
 def find_dupes(db, files):
@@ -287,9 +341,10 @@ def organize(db, files, out, by, compact=False):
         db.execute("REPLACE INTO copies VALUES (?, ?)", (str(dest), str(p)))
     db.commit()
     n["duplicates skipped"] = len(skip)
-    print(f"Organized into {out}: {', '.join(f'{v} {k}' for k, v in n.items() if v) or 'nothing to do'}")
+    counts = ", ".join(f"{v} {k}" for k, v in n.items() if v) or "nothing to do"
+    print(f"{_c(GREEN, '✓')} Sorted  {_c(BOLD, _home(out))}  {_c(DIM, counts)}")
     if skip:
-        print("  tagwerk dupes <folder> lists the duplicates")
+        print(_c(DIM, "          tagwerk dupes <folder> lists the duplicates"))
 
 
 def _artist_title(p):
@@ -320,7 +375,7 @@ def export_csv(db, files, out):
             w.writerow(head + [_n(r["bpm"]), r["key"], r["camelot"], track_energy(r), mood_of(r), *styles,
                                *(round(r["moods"][m] * 100) for m in MOODS), _n(r["valence"]), _n(r["arousal"]),
                                " ".join(build_tags(r)), ""])
-    print(f"Report: {out}")
+    print(f"{_c(GREEN, '✓')} Report  {_c(BOLD, _home(out))}")
 
 
 def summary(db, files):
@@ -330,20 +385,21 @@ def summary(db, files):
     if not done:
         return
     bpms = [r["bpm"] for r in done]
-    print(f"\n{len(done)} tracks · {min(bpms):.0f}–{max(bpms):.0f} BPM")
+    print(f"\n{_c(BOLD, f'{len(done)} tracks')} · {min(bpms):.0f}–{max(bpms):.0f} BPM")
     styles = Counter(r["styles"][0][0].split("---")[-1] for r in done).most_common()
     top, width = styles[0][1], max(len(s) for s, _ in styles[:8])
     for s, n in styles[:8]:
-        print(f"  {s:<{width}}  {'█' * max(1, round(n / top * 30))} {n}")
+        print(f"  {s:<{width}}  {_c(CYAN, '█' * max(1, round(n / top * 30)))} {n}")
     if len(styles) > 8:
-        print(f"  … {len(styles) - 8} more styles")
-    print("  moods: " + " · ".join(f"{m} {n}" for m, n in Counter(mood_of(r) for r in done).most_common()))
+        print(_c(DIM, f"  … {len(styles) - 8} more styles"))
+    moods = Counter(mood_of(r) for r in done).most_common()
+    print(f"  {_c(DIM, 'moods')}  " + " · ".join(f"{m} {_c(BOLD, n)}" for m, n in moods))
     hand, learned = sum(bool(r["manual"]) for r in done), sum(bool(r.get("learned")) for r in done)
     broken = sum(1 for _, r, e in results if e)
     extra = [f"{n} {what}" for n, what in [(hand, "edited by hand"), (learned, "tagged from your examples"),
                                            (broken, "unreadable (see --csv)")] if n]
     if extra:
-        print("  " + " · ".join(extra))
+        print(_c(DIM, "  " + " · ".join(extra)))
 
 
 def edit(argv):
@@ -392,9 +448,11 @@ def edit(argv):
         db.commit()
     for p, r, err in _results(db, files):  # with no options, edit just shows what tagwerk thinks
         if r:
-            print(f"{p.name}: {r['bpm']} {r['camelot']} {' '.join(build_tags(r))}")
+            tags = " ".join(build_tags(r))
+            print(f"{p.name}  {_c(BOLD, r['bpm'])} {_c(CYAN, r['camelot'])} {mood_of(r)}  {_c(DIM, tags)}")
         else:
-            print(f"{p.name}: not analyzed yet ({err or 'run tagwerk on its folder'}), edits apply once it is")
+            print(f"{p.name}  {_c(YELLOW, 'not analyzed yet')} ({err or 'run tagwerk on its folder'}), "
+                  "edits apply once it is")
 
 
 def similar(argv):
@@ -413,11 +471,13 @@ def similar(argv):
     sims = np.stack([emb[p] for p in paths]) @ emb[me]
     order = [i for i in sims.argsort()[::-1] if sims[i] < 0.9999][:a.n]  # 1.0 = the same file in another playlist
     (_, ref, _), *rest = _results(db, [Path(me)] + [Path(paths[i]) for i in order])
-    print(f"Like {Path(me).name} ({ref['bpm']} BPM, {ref['camelot']}); ✓ = mixable (±6% BPM, compatible key)")
+    print(f"Like {_c(BOLD, Path(me).name)} ({ref['bpm']} BPM, {ref['camelot']})  "
+          + _c(DIM, "✓ = mixable: ±6% BPM, compatible key"))
     for i, (p, r, _) in zip(order, rest):
         ok = abs(r["bpm"] / ref["bpm"] - 1) <= 0.06 and compatible(r["camelot"], ref["camelot"])
-        style = r["styles"][0][0].split("---")[-1]
-        print(f"  {sims[i]:.2f} {'✓' if ok else ' '} {r['bpm']:>5.1f} {r['camelot']:>3}  {style[:18]:<18} {p.name}")
+        style, sim, key = r["styles"][0][0].split("---")[-1], f"{sims[i]:.2f}", f"{r['camelot']:>3}"
+        mark = _c(GREEN, "✓") if ok else " "
+        print(f"  {_c(DIM, sim)} {mark} {r['bpm']:>5.1f} {_c(CYAN, key)}  {_fit(style, 18)} {p.name}")
 
 
 def dupes(argv):
@@ -428,9 +488,10 @@ def dupes(argv):
     a = ap.parse_args(argv)
     groups = find_dupes(open_db(a.db), audio_files(a.folder))
     for g in groups:
-        print(g[0].name)
+        print(_c(BOLD, g[0].name))
         for i, p in enumerate(g):
-            print(f"  {'keep' if i == 0 else 'skip'}  {p.stat().st_size / 1e6:6.1f} MB  {p}")
+            mark = _c(GREEN, "keep") if i == 0 else _c(DIM, "skip")
+            print(f"  {mark}  {p.stat().st_size / 1e6:6.1f} MB  {_home(p)}")
     n = len(groups)
     print(f"{n} track{'s' * (n > 1)} saved more than once" if n else "No duplicates among the analyzed tracks.")
 
@@ -444,16 +505,17 @@ def setup(argv):
     argparse.ArgumentParser(prog="tagwerk setup", description=setup.__doc__).parse_args(argv)
 
     def ask(question, default):
-        return input(f"{question} [{default}]: ").strip() or default
+        return input(f"{_c(BOLD, '?')} {question} {_c(DIM, f'[{_home(default)}]')} ").strip() or str(default)
 
+    print(f"{_c(BOLD, f'tagwerk {VERSION}')} setup: a few questions, Enter keeps the default.\n")
     try:
         while not (files := audio_files(src := Path(ask("Music folder to read", "~/Music")).expanduser())):
-            print(f"  no audio files in {src}")
-        print(f"  {len(files)} tracks")
+            print(_c(YELLOW, f"  no audio files in {_home(src)}"))
+        print(_c(DIM, f"  {len(files)} tracks"))
         out = Path(ask("Where should the sorted copies go? Originals are never moved", src.parent / "Tagwerk"))
-        print("Folder layout:")
+        print("  Folder layout:")
         for k, (name, _) in PRESETS.items():
-            print(f"  {k}. {name}")
+            print(f"    {_c(CYAN, k)}  {name}")
         while True:
             by = ask(f"Pick one, or type levels like key,energy ({', '.join(LAYOUT)})", "1").replace(" ", "")
             by = PRESETS[by][1] if by in PRESETS else by
@@ -464,7 +526,7 @@ def setup(argv):
         tags = ask("Also write tags into the files' Comment field (for rekordbox)? y/n", "n").lower().startswith("y")
         cmd = [str(src), "--organize", str(out.expanduser()), "--by", by] + ["--compact"] * compact
         cmd += ["--write-tags"] * tags
-        print(f"\nYour command, run it again any time to update:\n  tagwerk {shlex.join(cmd)}\n")
+        print(f"\nYour command, run it again any time to update:\n  {_c(BOLD, 'tagwerk ' + shlex.join(cmd))}\n")
         if ask("Run it now? y/n", "y").lower().startswith("y"):
             main(cmd)
     except (KeyboardInterrupt, EOFError):
@@ -481,6 +543,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="tagwerk", description="Analyze, tag and organize your music (BPM, key, style, mood).",
         epilog="new here? tagwerk setup asks a few questions instead. more: tagwerk edit|similar|dupes --help")
+    ap.add_argument("--version", action="version", version=f"tagwerk {VERSION}")
     ap.add_argument("folder", help="folder to analyze (recursive)")
     ap.add_argument("--organize", metavar="OUT",
                     help="where the sorted copies and the report go (default: a Tagwerk folder next to FOLDER)")
@@ -502,6 +565,8 @@ def main(argv=None):
     base = src if src.is_dir() else src.parent
     out = None if a.analyze_only else Path(a.organize or base.parent / "Tagwerk").expanduser().resolve()
     csv_out = a.csv or (out / "tagwerk-report.csv" if out else None)
+    begin = time.monotonic()
+    print(f"{_c(BOLD, f'tagwerk {VERSION}')}  {_home(src)}" + (f" {_c(DIM, '→')} {_home(out)}" if out else ""))
     db = open_db(a.db)
     with _working(f"Looking for music in {a.folder}"):
         made = {d for (d,) in db.execute("SELECT dest FROM copies")}
@@ -521,6 +586,7 @@ def main(argv=None):
     if csv_out:
         export_csv(db, files, csv_out)
     summary(db, files)
+    print(_c(DIM, f"\nDone in {_duration(time.monotonic() - begin)}"))
 
 
 if __name__ == "__main__":

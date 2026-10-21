@@ -1,8 +1,26 @@
 <p align="center"><img src="assets/icon.svg" width="128" alt="Tagwerk icon"></p>
 
-# Tagwerk
+<h1 align="center">Tagwerk</h1>
 
-Point it at a folder of music and it listens to every track, on your own machine, then sorts copies into folders by **style, mood and BPM**, writes a **report** you can open in Excel, and can tag the files for **rekordbox**. Built for DJs with big, messy electronic libraries.
+<p align="center"><b>Your music, sorted by sound.</b><br>
+Point it at a folder: it listens to every track on your own machine, then sorts copies into folders by <b>style, mood and BPM</b>, writes a <b>report</b> you can open in Excel, and can tag the files for <b>rekordbox</b>.</p>
+
+<p align="center">
+  <img alt="version" src="https://img.shields.io/badge/dynamic/toml?url=https%3A%2F%2Fraw.githubusercontent.com%2Fg1lg1l%2Ftagwerk%2Fmain%2Fpyproject.toml&query=%24.project.version&label=version&color=2de2e6">
+  <img alt="python" src="https://img.shields.io/badge/python-3.10%2B-b6ff3b">
+  <img alt="platforms" src="https://img.shields.io/badge/macOS%20%C2%B7%20Linux%20%C2%B7%20Windows%20(WSL2)-runs%20locally-555">
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#install">Install</a> ·
+  <a href="#commands">Commands</a> ·
+  <a href="#how-it-sorts">How it sorts</a> ·
+  <a href="#fix-it-by-hand">Fix it by hand</a> ·
+  <a href="#troubleshooting">Troubleshooting</a>
+</p>
+
+Built for DJs with big, messy electronic libraries. Nothing is uploaded: the AI models run on your computer.
 
 - **BPM** (half-time detections fixed) and **key** in Camelot notation
 - **Style** from 400 Discogs styles: techno, hardgroove, dub techno, minimal, acid, DnB…
@@ -17,7 +35,26 @@ uv tool install --python 3.12 git+https://github.com/g1lg1l/tagwerk
 tagwerk setup
 ```
 
-`setup` asks four questions (which folder, where the copies go, which layout, write tags or not), shows the command it built and runs it. Run that command again whenever you add music: only new tracks get analyzed.
+`setup` asks a few questions (which folder, where the copies go, which layout, write tags or not), shows the command it built and runs it. Run that command again whenever you add music: only new tracks get analyzed.
+
+What a run looks like:
+
+```
+tagwerk 0.4.1  ~/Music/HardGroove Set → ~/Music/Tagwerk
+96 tracks · 94 already analyzed · 2 to analyze
+1/2  Ocean Drive.mp3     145.0  8A  #techno #hardgroove #energetic E5
+2/2  Moon Rotation.mp3   138.0  1A  #techno #deep-techno #deep #aggressive E5
+✓ Sorted  ~/Music/Tagwerk  2 copied, 94 already there
+✓ Report  ~/Music/Tagwerk/tagwerk-report.csv
+
+96 tracks · 121–153 BPM
+  Techno       ██████████████████████████████ 78
+  Tech Trance  ███ 7
+  Hard Techno  ██ 4
+  moods  Energetic 67 · Melodic 19 · Deep 8 · Dark 2
+
+Done in 0m21s
+```
 
 ## Install
 
@@ -95,7 +132,7 @@ Every command has `--help`.
 | `--write-tags` | off | Write tags into the Comment field of your **original** files ([details](#tags-in-the-files)) |
 | `--db FILE` | `~/.tagwerk/tagwerk.db` | Use another library database |
 
-Ctrl‑C stops cleanly at any time: the next run picks up where it left off. A spinner with elapsed time shows it's working, and each run ends with an overview of your styles and moods.
+Ctrl‑C stops cleanly at any time: the next run picks up where it left off. While it works, a spinner with elapsed time shows what it's on; each run ends with an overview of your styles and moods. Colors turn off when the output isn't a terminal, or with `NO_COLOR=1`. `tagwerk --version` prints the version.
 
 ## How it sorts
 
@@ -169,6 +206,18 @@ tw: #techno #hardgroove #energetic #aggressive E6; 8A - Energy 7
 | Report | `tagwerk-report.csv` in the output folder: `;` and decimal commas, so an Italian-locale Excel opens it on double click |
 
 Thresholds and vocabularies live at the top of [`tagwerk/tags.py`](tagwerk/tags.py): `STYLE_MIN`, `MOOD_MIN`, `MOOD_GROUPS`, `MOOD_TAGS`, `LEARN_MIN`, `LEARN_EXAMPLES`, `DUPE_MIN`, the clean-name patterns `_DIRT`, the style renames in `relabel_styles` and the half-time rule in `fold_bpm`. Everything is recomputed from the cache, so changing them needs no re-analysis.
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| First run is slow | Normal: models download once (~30 MB) and every track is listened to (5–10 s each). Re-runs only analyze new or changed files |
+| `command not found: tagwerk` | Run `uv tool update-shell`, then open a new terminal |
+| `no audio files in …` | Check the path; quote names with spaces: `tagwerk "~/Music/My Set"` won't expand `~`, use `tagwerk ~/Music/"My Set"` |
+| A track got the wrong style or mood | `tagwerk edit <track> --style … --mood …`, then run again: the copy moves to the right folder |
+| Copies landed in a folder you don't want | Delete the `Tagwerk/` folder and run again with other options: your originals are never touched |
+| Windows: can't find my music | Inside WSL your drives are under `/mnt/c/`, e.g. `tagwerk /mnt/c/Users/<you>/Music` |
+| Same track in two folders | It's copied once; `tagwerk dupes <folder>` shows which file was kept |
 
 ## Development
 
