@@ -3,14 +3,17 @@ tagwerk setup: a few questions instead of flags. tagwerk edit <file|folder>: han
 tagwerk similar <file>: tracks that sound alike. tagwerk dupes <folder>: tracks saved more than once."""
 import argparse
 import csv
+import itertools
 import json
 import os
 import shlex
 import shutil
 import sqlite3
 import sys
+import threading
 import time
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 
 import mutagen
@@ -49,6 +52,42 @@ def _duration(s):
     return f"{s // 3600:.0f}h{s % 3600 // 60:02.0f}m" if s >= 3600 else f"{s // 60:.0f}m{s % 60:02.0f}s"
 
 
+@contextmanager
+def _working(label):
+    """A spinner with elapsed time after label while the block runs, so slow steps never look stuck.
+    Yields [label]: change it to update the text. Only in a terminal, logs and pipes stay clean."""
+    status = [label]
+    if not sys.stdout.isatty():
+        yield status
+        return
+    stop = threading.Event()
+
+    def spin():
+        start = time.monotonic()
+        for c in itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"):
+            print(f"\r\033[K{status[0]} {c} {time.monotonic() - start:.0f}s", end="", flush=True)
+            if stop.wait(0.1):
+                break
+
+    t = threading.Thread(target=spin, daemon=True)
+    t.start()
+    try:
+        yield status
+    finally:
+        stop.set()
+        t.join()
+        print("\r\033[K", end="", flush=True)
+
+
+def _each(items, what):
+    """Iterates items under a spinner showing 'what i/n'."""
+    items = list(items)
+    with _working(what) as status:
+        for i, x in enumerate(items, 1):
+            status[0] = f"{what} {i}/{len(items)}"
+            yield x
+
+
 def analyze_new(db, files, limit=None):
     """Analyzes only new or modified files; a broken file is logged and retried only if it changes."""
     cached = dict(db.execute("SELECT path, mtime FROM tracks"))
@@ -56,21 +95,24 @@ def analyze_new(db, files, limit=None):
     print(f"{len(files)} files, {len(files) - len(todo)} already analyzed, {len(todo)} to analyze")
     if not todo:
         return
-    from .analyze import Analyzer  # heavy import (TensorFlow): only when needed
-    analyzer = Analyzer()
+    with _working("Loading models (the first run also downloads them, ~25 MB)"):
+        from .analyze import Analyzer  # heavy import (TensorFlow): only when needed
+        analyzer = Analyzer()
     start = time.monotonic()
     for i, p in enumerate(todo, 1):
+        left = (time.monotonic() - start) / (i - 1) * (len(todo) - i + 1) if i > 1 else 0
+        prefix = f"[{i}/{len(todo)}{f' · {_duration(left)} left' if left else ''}] {p.name}"
         try:
-            r = analyzer.analyze(p)
+            with _working(prefix):
+                r = analyzer.analyze(p)
             emb = r.pop("embedding").astype(np.float32).tobytes()
             db.execute("REPLACE INTO tracks VALUES (?, ?, ?, ?, NULL)", (str(p), p.stat().st_mtime, json.dumps(r), emb))
-            line = f"{p.name} → {fold_bpm(r['bpm'], r['styles'])} {r['camelot']} {' '.join(build_tags(r))}"
+            line = f"→ {fold_bpm(r['bpm'], r['styles'])} {r['camelot']} {' '.join(build_tags(r))}"
         except Exception as e:
             db.execute("REPLACE INTO tracks VALUES (?, ?, NULL, NULL, ?)", (str(p), p.stat().st_mtime, str(e)))
-            line = f"{p.name} ✗ {e}"
+            line = f"✗ {e}"
         db.commit()
-        left = (time.monotonic() - start) / i * (len(todo) - i)
-        print(f"[{i}/{len(todo)}{f' · {_duration(left)} left' if i < len(todo) else ''}] {line}")
+        print(f"{prefix} {line}")
 
 
 def _load(d, manual):
@@ -181,7 +223,7 @@ def organize(db, files, out, by):
     edit moves the copy to its new folder and refreshes it if the original changed (e.g. --write-tags)."""
     skip = {p for g in find_dupes(db, files) for p in g[1:]}
     n = Counter()
-    for p, r, _ in _results(db, files):
+    for p, r, _ in _each(_results(db, files), "Organizing"):
         if not r or p in skip:
             continue  # not analyzed yet (--limit), unreadable, or a duplicate of a better copy
         d = out.joinpath(*folder_for(r, by))
@@ -231,7 +273,7 @@ def export_csv(db, files, out):
     with open(out, "w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh, delimiter=";")
         w.writerow(cols)
-        for p, r, err in _results(db, files):
+        for p, r, err in _each(_results(db, files), "Writing CSV"):
             head = [p.name, *_artist_title(p)]
             if not r:
                 w.writerow(head + [""] * (len(cols) - 4) + [err or "not analyzed"])
@@ -409,7 +451,8 @@ def main(argv=None):
     by = a.by.split(",")
     if unknown := [k for k in by if k not in LAYOUT]:
         ap.error(f"unknown --by level(s): {', '.join(unknown)}; choose from {', '.join(LAYOUT)}")
-    files = audio_files(a.folder)
+    with _working(f"Looking for music in {a.folder}"):
+        files = audio_files(a.folder)
     if a.organize:
         out = Path(a.organize).resolve()
         files = [p for p in files if out not in p.resolve().parents]  # never re-analyze our own copies
