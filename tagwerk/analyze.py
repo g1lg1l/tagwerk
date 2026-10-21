@@ -41,11 +41,17 @@ def _fetch(name):
     for ext in ("json", "pb"):
         dest = MODELS_DIR / f"{Path(name).name}.{ext}"
         if not dest.exists():
-            tmp = dest.with_name(dest.name + ".part")  # no half-downloaded models if interrupted
+            tmp = dest.with_name(f"{dest.name}.{os.getpid()}.part")  # no half-downloaded models if interrupted
             urllib.request.urlretrieve(f"{MODELS_URL}/{name}.{ext}", tmp)
             tmp.rename(dest)
     meta = json.loads((MODELS_DIR / f"{Path(name).name}.json").read_text())
     return str(MODELS_DIR / f"{Path(name).name}.pb"), meta
+
+
+def fetch_models():
+    """Downloads every model up front, in one process, so parallel workers never race on a download."""
+    for name in [EFFNET, MUSICNN, STYLES, DEAM, THEMES, *(n for n, _ in HEADS.values())]:
+        _fetch(name)
 
 
 def _output(meta, purpose):
@@ -109,3 +115,23 @@ class Analyzer:
             "duration": round(len(audio) / 44100, 1),
             "embedding": emb.mean(axis=0),  # for personal categories and similar tracks, without re-analysis
         }
+
+
+_analyzer = None  # one per worker process
+
+
+def init_worker():
+    """Pool initializer: loads the models once per process; native logging goes to /dev/null for its whole life."""
+    global _analyzer
+    os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
+    _analyzer = Analyzer()
+
+
+def analyze_file(path):
+    """(path, result, error) for a pool worker: one broken file never takes the run down."""
+    try:
+        r = _analyzer.analyze(path)
+        r["embedding"] = r["embedding"].astype("float32").tobytes()
+        return path, r, None
+    except Exception as e:
+        return path, None, str(e)

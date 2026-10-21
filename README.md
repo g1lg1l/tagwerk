@@ -40,7 +40,7 @@ tagwerk setup
 What a run looks like:
 
 ```
-tagwerk 0.4.1  ~/Music/HardGroove Set → ~/Music/Tagwerk
+tagwerk 0.5.0  ~/Music/HardGroove Set → ~/Music/Tagwerk
 96 tracks · 94 already analyzed · 2 to analyze
 1/2  Ocean Drive.mp3     145.0  8A  #techno #hardgroove #energetic E5
 2/2  Moon Rotation.mp3   138.0  1A  #techno #deep-techno #deep #aggressive E5
@@ -72,7 +72,7 @@ tagwerk is a command-line tool. Install it once and `tagwerk` works from any fol
 | uninstall | `uv tool uninstall tagwerk` (your music and copies stay) |
 | hack on it | clone, then `uv tool install --python 3.12 -e .` in the clone: code changes apply without reinstalling |
 
-**Speed**: the first run downloads the models (~30 MB, once) and analyzes each track, about 5–10 s per track on a recent laptop, so a 100-track folder takes 10–15 minutes. After that every result is cached: re-runs, other layouts, reports and edits are instant.
+**Speed**: the first run downloads the models (~30 MB, once) and listens to every track, several at a time: about 5 s per track on a 10-core Mac, so a 100-track folder takes around 8 minutes. After that every result is cached: re-runs, other layouts, reports and edits are instant.
 
 ## What you get
 
@@ -129,6 +129,7 @@ Every command has `--help`.
 | `--csv FILE` | `OUT/tagwerk-report.csv` | Report somewhere else |
 | `--analyze-only` | off | Just analyze: no copies, no report |
 | `--limit N` | all | Analyze at most N new tracks: try it on a few first |
+| `--jobs N` | half your cores, max 4 | Tracks analyzed at once; lower it if the computer gets sluggish |
 | `--write-tags` | off | Write tags into the Comment field of your **original** files ([details](#tags-in-the-files)) |
 | `--db FILE` | `~/.tagwerk/tagwerk.db` | Use another library database |
 
@@ -211,7 +212,7 @@ Thresholds and vocabularies live at the top of [`tagwerk/tags.py`](tagwerk/tags.
 
 | Problem | Fix |
 |---|---|
-| First run is slow | Normal: models download once (~30 MB) and every track is listened to (5–10 s each). Re-runs only analyze new or changed files |
+| First run is slow | Normal: models download once (~30 MB) and every track is listened to (~5 s each, several at a time). Re-runs only analyze new or changed files |
 | `command not found: tagwerk` | Run `uv tool update-shell`, then open a new terminal |
 | `no audio files in …` | Check the path; quote names with spaces: `tagwerk "~/Music/My Set"` won't expand `~`, use `tagwerk ~/Music/"My Set"` |
 | A track got the wrong style or mood | `tagwerk edit <track> --style … --mood …`, then run again: the copy moves to the right folder |

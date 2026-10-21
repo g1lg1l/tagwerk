@@ -30,6 +30,9 @@ MOODS = ("aggressive", "relaxed", "happy", "sad", "party", "danceable", "voice")
 # one library database wherever you run tagwerk from
 DB = str(Path(os.environ.get("TAGWERK_HOME", Path.home() / ".tagwerk")) / "tagwerk.db")
 BY = "style,mood,bpm"
+# tracks analyzed at once. On a 10-core M-series one worker already keeps ~3.4 cores busy (TensorFlow threads):
+# 16 tracks took 146 s with 1, 88 s with 2, 76 s with 4-5 at 2 TF threads each, worse beyond
+JOBS = max(1, min(4, (os.cpu_count() or 2) // 2))
 
 
 def _version():
@@ -102,6 +105,15 @@ def _duration(s):
     return f"{s // 3600:.0f}h{s % 3600 // 60:02.0f}m" if s >= 3600 else f"{s // 60:.0f}m{s % 60:02.0f}s"
 
 
+_LOCK = threading.Lock()  # the spinner and _say share the line
+
+
+def _say(line):
+    """Prints a line, above a running spinner if there is one."""
+    with _LOCK:
+        print(f"\r\033[K{line}" if sys.stdout.isatty() else line, flush=True)
+
+
 @contextmanager
 def _working(label):
     """A spinner with elapsed time after label while the block runs, so slow steps never look stuck.
@@ -115,8 +127,9 @@ def _working(label):
     def spin():
         start = time.monotonic()
         for c in itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"):
-            print(f"\r\033[K{status[0]} {_c(CYAN, c)} {_c(DIM, f'{time.monotonic() - start:.0f}s')}", end="",
-                  flush=True)
+            with _LOCK:
+                print(f"\r\033[K{status[0]} {_c(CYAN, c)} {_c(DIM, f'{time.monotonic() - start:.0f}s')}", end="",
+                      flush=True)
             if stop.wait(0.1):
                 break
 
@@ -155,36 +168,45 @@ def _add_themes(db):
         db.commit()
 
 
-def analyze_new(db, files, limit=None):
-    """Analyzes only new or modified files; a broken file is logged and retried only if it changes."""
+def analyze_new(db, files, limit=None, jobs=JOBS):
+    """Analyzes only new or modified files, `jobs` at a time; a broken file is logged and retried only if it
+    changes."""
     cached = dict(db.execute("SELECT path, mtime FROM tracks"))
-    todo = [p for p in files if cached.get(str(p)) != p.stat().st_mtime][:limit]
-    cached = len(files) - len(todo)
-    print(f"{_c(BOLD, len(files))} tracks · {cached} already analyzed · {_c(BOLD, len(todo))} to analyze")
+    new = [p for p in files if cached.get(str(p)) != p.stat().st_mtime]
+    todo = new[:limit]
+    later = f" (--limit: {len(new) - len(todo)} left for next time)" if len(todo) < len(new) else ""
+    print(f"{_c(BOLD, len(files))} tracks · {len(files) - len(new)} already analyzed · "
+          f"{_c(BOLD, len(todo))} to analyze{later}")
     _add_themes(db)
     if not todo:
         return
-    with _working("Loading models (the first run also downloads them, ~30 MB)"), _quiet_native():
-        from .analyze import Analyzer  # heavy import (TensorFlow): only when needed
-        analyzer = Analyzer()
+    with _working("Getting the models ready (the first run downloads them, ~30 MB)"), _quiet_native():
+        from . import analyze  # heavy import (TensorFlow): only when needed
+        analyze.fetch_models()
+    from multiprocessing import get_context
+    jobs = max(1, min(jobs, len(todo)))
+    # each worker's TensorFlow would grab every core; sharing them out beats letting them fight (inherited by spawn)
+    os.environ.setdefault("TF_NUM_INTRAOP_THREADS", str(max(1, (os.cpu_count() or 2) // jobs)))
+    os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
     start, width, digits = time.monotonic(), min(40, max(len(p.name) for p in todo)), len(str(len(todo)))
-    for i, p in enumerate(todo, 1):
-        left = (time.monotonic() - start) / (i - 1) * (len(todo) - i + 1) if i > 1 else 0
-        count = _c(DIM, f"{i:>{digits}}/{len(todo)}{f' · {_duration(left)} left' if left else ''}")
-        prefix = f"{count}  {_fit(p.name, width)}"
-        try:
-            with _working(prefix), _quiet_native():
-                r = analyzer.analyze(p)
-            emb = r.pop("embedding").astype(np.float32).tobytes()
-            db.execute("REPLACE INTO tracks VALUES (?, ?, ?, ?, NULL)", (str(p), p.stat().st_mtime, json.dumps(r), emb))
-            r = _load(json.dumps(r), {})  # as every other command sees it: half-time fixed, styles relabelled
-            bpm, key, tags = f"{r['bpm']:5.1f}", f"{r['camelot']:>3}", " ".join(build_tags(r))
-            line = f"{_c(BOLD, bpm)} {_c(CYAN, key)}  {_c(DIM, tags)}"
-        except Exception as e:
-            db.execute("REPLACE INTO tracks VALUES (?, ?, NULL, NULL, ?)", (str(p), p.stat().st_mtime, str(e)))
-            line = _c(RED, f"✗ {e}")
-        db.commit()
-        print(f"{prefix}  {line}")
+    # spawn: TensorFlow doesn't survive fork; the workers inherit the muted stderr
+    with _quiet_native(), get_context("spawn").Pool(jobs, initializer=analyze.init_worker) as pool, \
+            _working(f"Loading models in {jobs} worker{'s' * (jobs > 1)}") as status:
+        for i, (p, r, err) in enumerate(pool.imap_unordered(analyze.analyze_file, todo), 1):
+            if r:
+                emb = r.pop("embedding")
+                db.execute("REPLACE INTO tracks VALUES (?, ?, ?, ?, NULL)",
+                           (str(p), p.stat().st_mtime, json.dumps(r), emb))
+                r = _load(json.dumps(r), {})  # as every other command sees it: half-time fixed, styles relabelled
+                bpm, key, tags = f"{r['bpm']:5.1f}", f"{r['camelot']:>3}", " ".join(build_tags(r))
+                line = f"{_c(BOLD, bpm)} {_c(CYAN, key)}  {_c(DIM, tags)}"
+            else:
+                db.execute("REPLACE INTO tracks VALUES (?, ?, NULL, NULL, ?)", (str(p), p.stat().st_mtime, err))
+                line = _c(RED, f"✗ {err}")
+            db.commit()
+            left = (time.monotonic() - start) / i * (len(todo) - i)
+            status[0] = f"Analyzing {jobs} at a time" + (f" · {_duration(left)} left" if i < len(todo) else "")
+            _say(f"{_c(DIM, f'{i:>{digits}}/{len(todo)}')}  {_fit(p.name, width)}  {line}")
 
 
 def _load(d, manual):
@@ -555,6 +577,7 @@ def main(argv=None):
     ap.add_argument("--csv", help="report file (default: OUT/tagwerk-report.csv)")
     ap.add_argument("--analyze-only", action="store_true", help="just analyze: no copies, no report")
     ap.add_argument("--limit", type=int, help="analyze at most N new tracks (for trying things out)")
+    ap.add_argument("--jobs", type=int, default=JOBS, help=f"tracks analyzed at once (default here: {JOBS})")
     ap.add_argument("--write-tags", action="store_true", help="write tags into the Comment field of the original files")
     a = ap.parse_args(argv)
 
@@ -576,7 +599,7 @@ def main(argv=None):
     if not files:
         ap.error(f"no audio files in {a.folder}")
     try:
-        analyze_new(db, files, a.limit)
+        analyze_new(db, files, a.limit, a.jobs)
     except KeyboardInterrupt:
         sys.exit("\nStopped. Everything analyzed so far is saved: run the same command again to resume.")
     if a.write_tags:
