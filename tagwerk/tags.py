@@ -4,15 +4,21 @@ import re
 import mutagen
 from mutagen.id3 import COMM, ID3
 
-STYLE_MIN = 0.25  # 2nd and 3rd style only above this; the 1st always
-MOOD_MIN = 0.5
-# ponytail: absolute cosine floor for learned tags, calibrate on a real library (#9)
-LEARN_MIN = 0.9  # a track inherits hand tags only from a hand-tagged track at least this similar
+# Calibrated on a 96-track hardgroove/techno set (#9); numbers in the comments are from that set.
+# 2nd and 3rd style tags only above this (the 1st always). 0.25 put #tech-trance on 28 tracks, 7 really were
+STYLE_MIN = 0.4
+# extra mood flags (#aggressive #chill #happy). At 0.5, 40% of tracks sat in the 0.4-0.6 coin-flip zone
+MOOD_MIN = 0.65
+VOCAL_MIN = 0.5  # the voice model's own decision boundary: vocal vs instrumental
+# a track inherits hand tags only from a hand-tagged track at least this similar: only 5% of random pairs reach
+# 0.9, while most tracks have a neighbour above it
+LEARN_MIN = 0.9
 LEARN_EXAMPLES = 5  # a hand tag spreads to other tracks only once you've put it on this many
-# ponytail: guessed, calibrate on real duplicates (#9)
-DUPE_MIN = 0.995  # about the same length and at least this similar = the same track saved twice
+# about the same length and at least this similar = the same track saved twice. A wav and its mp3 scored 0.9996,
+# the closest two different tracks 0.968
+DUPE_MIN = 0.995
 # model name -> tag; change the vocabulary freely
-MOOD_TAGS = {"aggressive": "aggressive", "relaxed": "chill", "happy": "happy", "voice": "vocal"}
+MOOD_TAGS = {"aggressive": "aggressive", "relaxed": "chill", "happy": "happy"}
 # mood folder/tag -> MTG-Jamendo mood/theme labels it covers; a track gets the strongest group. Change freely:
 # all 56 label scores are stored, so a new vocabulary needs no re-analysis
 MOOD_GROUPS = {"Energetic": ["energetic"], "Melodic": ["melodic"], "Deep": ["deep"], "Dark": ["dark"],
@@ -109,6 +115,8 @@ def build_tags(result):
     if (mood := mood_of(result)) != "Unknown":
         tags.append(tag(mood))
     tags += ["#" + t for name, t in MOOD_TAGS.items() if result["moods"][name] >= MOOD_MIN]
+    if result["moods"]["voice"] >= VOCAL_MIN:
+        tags.append("#vocal")
     tags += manual.get("add", []) + result.get("learned", [])
     tags = [t for t in tags if t not in manual.get("remove", [])]
     tags.append(f"E{track_energy(result)}")
@@ -130,7 +138,7 @@ LAYOUT = {
     "energy": lambda r: f"Energy {track_energy(r)}",
     "key": lambda r: r["camelot"],
     "mood": mood_of,
-    "vocals": lambda r: "Vocal" if r["moods"]["voice"] >= MOOD_MIN else "Instrumental",
+    "vocals": lambda r: "Vocal" if r["moods"]["voice"] >= VOCAL_MIN else "Instrumental",
 }
 _UNSAFE = re.compile(r'[<>:"/\\|?*]')  # characters not allowed in Windows folder names
 

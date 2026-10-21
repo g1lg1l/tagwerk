@@ -206,7 +206,7 @@ tw: #techno #hardgroove #energetic #aggressive E6; 8A - Energy 7
 | Models | `~/.cache/tagwerk/models` (`TAGWERK_MODELS` to move them) |
 | Report | `tagwerk-report.csv` in the output folder: `;` and decimal commas, so an Italian-locale Excel opens it on double click |
 
-Thresholds and vocabularies live at the top of [`tagwerk/tags.py`](tagwerk/tags.py): `STYLE_MIN`, `MOOD_MIN`, `MOOD_GROUPS`, `MOOD_TAGS`, `LEARN_MIN`, `LEARN_EXAMPLES`, `DUPE_MIN`, the clean-name patterns `_DIRT`, the style renames in `relabel_styles` and the half-time rule in `fold_bpm`. Everything is recomputed from the cache, so changing them needs no re-analysis.
+Thresholds and vocabularies live at the top of [`tagwerk/tags.py`](tagwerk/tags.py): `STYLE_MIN`, `MOOD_MIN`, `VOCAL_MIN`, `MOOD_GROUPS`, `MOOD_TAGS`, `LEARN_MIN`, `LEARN_EXAMPLES`, `DUPE_MIN`, the clean-name patterns `_DIRT`, the style renames in `relabel_styles` and the half-time rule in `fold_bpm`. Everything is recomputed from the cache, so changing them needs no re-analysis.
 
 ## Troubleshooting
 

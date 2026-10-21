@@ -63,7 +63,7 @@ def test_merge_comment_preserves_existing():
 
 def test_build_tags():
     r = {
-        "styles": [("Electronic---Dub Techno", 0.6), ("Reggae---Dub", 0.3), ("Electronic---Dub", 0.28)],
+        "styles": [("Electronic---Dub Techno", 0.6), ("Reggae---Dub", 0.45), ("Electronic---Dub", 0.42)],
         "moods": {"aggressive": 0.1, "relaxed": 0.7, "happy": 0.2, "sad": 0.55, "voice": 0.1},
         "arousal": 4.0,
     }
