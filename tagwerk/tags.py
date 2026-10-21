@@ -6,6 +6,9 @@ from mutagen.id3 import COMM, ID3
 
 STYLE_MIN = 0.25  # 2nd and 3rd style only above this; the 1st always
 MOOD_MIN = 0.5
+# ponytail: absolute cosine floor for learned tags, calibrate on a real library (#9)
+LEARN_MIN = 0.9  # a track inherits hand tags only from a hand-tagged track at least this similar
+LEARN_EXAMPLES = 5  # a hand tag spreads to other tracks only once you've put it on this many
 # model name -> tag; change the vocabulary freely
 MOOD_TAGS = {"aggressive": "aggressive", "relaxed": "chill", "happy": "happy", "sad": "dark", "voice": "vocal"}
 
@@ -37,21 +40,54 @@ def fold_bpm(bpm, styles):
     return bpm
 
 
+def compatible(a, b):
+    """Harmonic mixing on the Camelot wheel: same number, or same letter one step away (8A ~ 8B, 7A, 9A)."""
+    (na, la), (nb, lb) = (int(a[:-1]), a[-1]), (int(b[:-1]), b[-1])
+    return na == nb or (la == lb and (na - nb) % 12 in (1, 11))
+
+
 def energy(arousal):
     """DEAM arousal (1–9 scale) -> energy 1–10."""
     # ponytail: linear mapping, recalibrate on library percentiles if techno bunches up at the top (#5)
     return max(1, min(10, round(1 + (arousal - 1) / 8 * 9)))
 
 
+def track_energy(r):
+    return r.get("manual", {}).get("energy") or energy(r["arousal"])
+
+
+def tag(text):
+    """'Warm Up' / '#warm-up' -> '#warm-up'. No ';', it ends our block in the Comment field."""
+    return "#" + text.strip().lstrip("#").lower().replace(" ", "-").replace(";", "")
+
+
 def _slug(style):
-    return "#" + style.split("---")[-1].lower().replace(" ", "-")
+    return tag(style.split("---")[-1])
+
+
+KEY_RE = re.compile(r"^(1[0-2]|[1-9])[AB]$")
+
+
+def apply_manual(r, manual):
+    """Hand corrections win over the analysis. Applied on read: they survive re-analysis, and --reset undoes them."""
+    r["manual"] = manual
+    if "style" in manual:
+        rest = [s for s in r["styles"] if s[0].split("---")[-1] != manual["style"]]
+        r["styles"] = [(manual["style"], 1.0)] + rest[:2]
+    if "bpm" in manual:
+        r["bpm"] = manual["bpm"]
+    if "key" in manual:
+        r["key"] = r["camelot"] = manual["key"]
+    return r
 
 
 def build_tags(result):
-    styles = result["styles"]
+    styles, manual = result["styles"], result.get("manual", {})
     tags = [_slug(styles[0][0])] + [_slug(s) for s, p in styles[1:] if p >= STYLE_MIN]
-    tags += ["#" + tag for name, tag in MOOD_TAGS.items() if result["moods"][name] >= MOOD_MIN]
-    tags.append(f"E{energy(result['arousal'])}")
+    tags += ["#" + t for name, t in MOOD_TAGS.items() if result["moods"][name] >= MOOD_MIN]
+    tags += manual.get("add", []) + result.get("learned", [])
+    tags = [t for t in tags if t not in manual.get("remove", [])]
+    tags.append(f"E{track_energy(result)}")
     return list(dict.fromkeys(tags))  # dedupe keeping order (e.g. Reggae---Dub and Electronic---Dub)
 
 
@@ -72,7 +108,7 @@ def _mood(r):
 LAYOUT = {
     "style": lambda r: r["styles"][0][0].split("---")[-1],
     "bpm": lambda r: _bpm_range(r["bpm"]),
-    "energy": lambda r: f"Energy {energy(r['arousal'])}",
+    "energy": lambda r: f"Energy {track_energy(r)}",
     "key": lambda r: r["camelot"],
     "mood": _mood,
     "vocals": lambda r: "Vocal" if r["moods"]["voice"] >= MOOD_MIN else "Instrumental",
