@@ -22,6 +22,7 @@ EFFNET = "feature-extractors/discogs-effnet/discogs-effnet-bs64-1"
 MUSICNN = "feature-extractors/musicnn/msd-musicnn-1"
 STYLES = "classification-heads/genre_discogs400/genre_discogs400-discogs-effnet-1"
 DEAM = "classification-heads/deam/deam-msd-musicnn-2"
+THEMES = "classification-heads/mtg_jamendo_moodtheme/mtg_jamendo_moodtheme-discogs-effnet-1"
 # name -> (model, "positive" class); all of them run on Discogs-EffNet embeddings
 HEADS = {
     "aggressive": ("classification-heads/mood_aggressive/mood_aggressive-discogs-effnet-1", "aggressive"),
@@ -58,6 +59,14 @@ def _head(name):
     return model, meta["classes"]
 
 
+def theme_model():
+    """Mood/theme head (MTG-Jamendo, 56 labels: dark, deep, melodic, emotional…), run on the mean embedding, so
+    tracks analyzed before it existed get it from the cache. On the other heads that matches the per-frame mean
+    closely (r = 0.998 for aggressive and relaxed on a 96-track techno set)."""
+    model, classes = _head(THEMES)
+    return lambda emb: dict(zip(classes, (round(float(x), 3) for x in model(emb.reshape(1, -1).astype("float32"))[0])))
+
+
 class Analyzer:
     """Loads the models once, then analyzes one track at a time."""
 
@@ -68,6 +77,7 @@ class Analyzer:
         self.musicnn = es.TensorflowPredictMusiCNN(graphFilename=pb, output=_output(meta, "embeddings"))
         self.styles, self.style_names = _head(STYLES)
         self.deam, _ = _head(DEAM)
+        self.themes = theme_model()
         self.heads = {}
         for key, (name, positive) in HEADS.items():
             model, classes = _head(name)
@@ -93,6 +103,7 @@ class Analyzer:
             "key_strength": round(float(strength), 2),
             "styles": top_styles,
             "moods": {k: round(float(m(emb).mean(axis=0)[i]), 3) for k, (m, i) in self.heads.items()},
+            "themes": self.themes(emb.mean(axis=0)),
             "valence": round(float(valence), 2),
             "arousal": round(float(arousal), 2),
             "duration": round(len(audio) / 44100, 1),

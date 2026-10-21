@@ -12,10 +12,20 @@ LEARN_EXAMPLES = 5  # a hand tag spreads to other tracks only once you've put it
 # ponytail: guessed, calibrate on real duplicates (#9)
 DUPE_MIN = 0.995  # about the same length and at least this similar = the same track saved twice
 # model name -> tag; change the vocabulary freely
-MOOD_TAGS = {"aggressive": "aggressive", "relaxed": "chill", "happy": "happy", "sad": "dark", "voice": "vocal"}
+MOOD_TAGS = {"aggressive": "aggressive", "relaxed": "chill", "happy": "happy", "voice": "vocal"}
+# mood folder/tag -> MTG-Jamendo mood/theme labels it covers; a track gets the strongest group. Change freely:
+# all 56 label scores are stored, so a new vocabulary needs no re-analysis
+MOOD_GROUPS = {"Energetic": ["energetic"], "Melodic": ["melodic"], "Deep": ["deep"], "Dark": ["dark"],
+               "Emotional": ["emotional", "sad", "melancholic"], "Groovy": ["groovy"], "Uplifting": ["uplifting"]}
 
 _PC = {"C": 0, "C#": 1, "Db": 1, "D": 2, "D#": 3, "Eb": 3, "E": 4, "F": 5, "F#": 6, "Gb": 6,
        "G": 7, "G#": 8, "Ab": 8, "A": 9, "A#": 10, "Bb": 10, "B": 11}
+
+
+def relabel_styles(styles, bpm):
+    """Discogs files a lot of hardgroove under Schranz; real schranz runs 150+ BPM, so below that it's Hardgroove."""
+    # ponytail: one BPM rule, add more renames here if another style keeps landing on the wrong neighbour
+    return [("Electronic---Hardgroove" if s.endswith("---Schranz") and bpm < 150 else s, p) for s, p in styles]
 
 
 def camelot(key, scale):
@@ -83,9 +93,21 @@ def apply_manual(r, manual):
     return r
 
 
+def mood_of(r):
+    """The strongest mood group. No cutoff, so near-identical tracks don't flip between a mood and 'Neutral'."""
+    if "mood" in r.get("manual", {}):
+        return r["manual"]["mood"]
+    t = r.get("themes")
+    if not t:
+        return "Unknown"  # analyzed by tagwerk < 0.4 and not upgraded yet (any normal run does that)
+    return max(MOOD_GROUPS, key=lambda g: max(t[c] for c in MOOD_GROUPS[g]))
+
+
 def build_tags(result):
     styles, manual = result["styles"], result.get("manual", {})
     tags = [_slug(styles[0][0])] + [_slug(s) for s, p in styles[1:] if p >= STYLE_MIN]
+    if (mood := mood_of(result)) != "Unknown":
+        tags.append(tag(mood))
     tags += ["#" + t for name, t in MOOD_TAGS.items() if result["moods"][name] >= MOOD_MIN]
     tags += manual.get("add", []) + result.get("learned", [])
     tags = [t for t in tags if t not in manual.get("remove", [])]
@@ -101,18 +123,13 @@ def _bpm_range(bpm):
     return f"{lo}-{lo + BPM_STEP - 1} BPM"
 
 
-def _mood(r):
-    best = max(("aggressive", "relaxed", "happy", "sad"), key=lambda m: r["moods"][m])
-    return MOOD_TAGS[best].capitalize() if r["moods"][best] >= MOOD_MIN else "Neutral"
-
-
 # folder level -> subfolder name
 LAYOUT = {
     "style": lambda r: r["styles"][0][0].split("---")[-1],
     "bpm": lambda r: _bpm_range(r["bpm"]),
     "energy": lambda r: f"Energy {track_energy(r)}",
     "key": lambda r: r["camelot"],
-    "mood": _mood,
+    "mood": mood_of,
     "vocals": lambda r: "Vocal" if r["moods"]["voice"] >= MOOD_MIN else "Instrumental",
 }
 _UNSAFE = re.compile(r'[<>:"/\\|?*]')  # characters not allowed in Windows folder names

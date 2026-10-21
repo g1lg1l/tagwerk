@@ -11,7 +11,10 @@ import numpy as np  # noqa: E402
 
 from tagwerk.cli import MOODS, _results, edit, find_dupes, main, open_db, organize, summary  # noqa: E402
 from tagwerk.tags import (apply_manual, build_tags, camelot, clean_filename, clean_title, compatible,  # noqa: E402
-                          energy, fold_bpm, folder_for, merge_comment, tag)
+                          energy, fold_bpm, folder_for, merge_comment, relabel_styles, tag)
+
+THEMES = dict.fromkeys(["energetic", "melodic", "deep", "dark", "emotional", "sad", "melancholic", "groovy",
+                        "uplifting"], 0.01)
 
 
 def test_camelot():
@@ -64,10 +67,18 @@ def test_build_tags():
         "moods": {"aggressive": 0.1, "relaxed": 0.7, "happy": 0.2, "sad": 0.55, "voice": 0.1},
         "arousal": 4.0,
     }
-    assert build_tags(r) == ["#dub-techno", "#dub", "#chill", "#dark", "E4"]
+    assert build_tags(r) == ["#dub-techno", "#dub", "#chill", "E4"]  # no mood/theme scores yet: no mood tag
+    r["themes"] = THEMES | {"deep": 0.4}
+    assert build_tags(r) == ["#dub-techno", "#dub", "#deep", "#chill", "E4"]
     # the first style is always there, the others only above threshold
     r["styles"] = [("Electronic---Techno", 0.1), ("Electronic---Minimal", 0.05), ("Electronic---Acid", 0.01)]
     assert build_tags(r)[0] == "#techno" and "#minimal" not in build_tags(r)
+
+
+def test_relabel_styles():
+    styles = [("Electronic---Techno", 0.8), ("Electronic---Schranz", 0.6), ("Electronic---Hard Techno", 0.5)]
+    assert relabel_styles(styles, 144.0)[1] == ("Electronic---Hardgroove", 0.6)
+    assert relabel_styles(styles, 155.0) == styles  # real schranz tempo
 
 
 def test_folder_for():
@@ -77,9 +88,13 @@ def test_folder_for():
         "bpm": 144.7, "camelot": "8A", "arousal": 6.0,
     }
     assert folder_for(r, ["style", "bpm"]) == ["Hard Techno", "145-149 BPM"]
-    assert folder_for(r, ["energy", "key", "mood", "vocals"]) == ["Energy 7", "8A", "Aggressive", "Instrumental"]
-    r["moods"]["aggressive"] = 0.2
-    assert folder_for(r, ["mood"]) == ["Neutral"]  # no mood above threshold
+    r["themes"] = THEMES | {"energetic": 0.13, "melodic": 0.12}
+    assert folder_for(r, ["energy", "key", "mood", "vocals"]) == ["Energy 7", "8A", "Energetic", "Instrumental"]
+    r["themes"] |= {"melancholic": 0.2}  # Emotional covers emotional, sad and melancholic; no cutoff, the top wins
+    assert folder_for(r, ["mood"]) == ["Emotional"]
+    assert folder_for({**r, "themes": None}, ["mood"]) == ["Unknown"]
+    r["manual"] = {"mood": "Dark"}  # tagwerk edit --mood
+    assert folder_for(r, ["mood"]) == ["Dark"]
     assert folder_for({**r, "bpm": 174.0}, ["bpm"]) == ["170-174 BPM"]
     # style names with characters not allowed on Windows
     r["styles"][0] = ("Folk, World, & Country---Pop/Rock", 0.5)
@@ -184,7 +199,7 @@ def test_main_defaults_to_copies_and_report():
         db.commit()
         main([str(tmp / "lib" / "playlists"), "--db", db_path])  # no flags: copies + report next to the folder
         out = tmp / "lib" / "Tagwerk"
-        assert (out / "Techno" / "Neutral" / "140-144 BPM" / "track.mp3").exists()
+        assert (out / "Techno" / "Unknown" / "140-144 BPM" / "track.mp3").exists()  # no themes in this fake row
         assert "track.mp3" in (out / "tagwerk-report.csv").read_text(encoding="utf-8-sig")
         # scanning the parent now also finds our copies: they're skipped, not analyzed (no Essentia here)
         main([str(tmp / "lib"), "--db", db_path, "--analyze-only"])

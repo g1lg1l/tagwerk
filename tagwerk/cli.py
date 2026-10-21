@@ -19,8 +19,9 @@ from pathlib import Path
 import mutagen
 import numpy as np
 
-from .tags import (DUPE_MIN, KEY_RE, LAYOUT, LEARN_EXAMPLES, LEARN_MIN, apply_manual, build_tags, clean_filename,
-                   clean_title, compatible, fold_bpm, folder_for, tag, track_energy, update_comment)
+from .tags import (DUPE_MIN, KEY_RE, LAYOUT, LEARN_EXAMPLES, LEARN_MIN, MOOD_GROUPS, apply_manual, build_tags,
+                   clean_filename, clean_title, compatible, fold_bpm, folder_for, mood_of, relabel_styles, tag,
+                   track_energy, update_comment)
 
 AUDIO_EXT = {".mp3", ".wav", ".aiff", ".aif", ".flac", ".m4a", ".ogg"}
 MOODS = ("aggressive", "relaxed", "happy", "sad", "party", "danceable", "voice")  # same keys as analyze.HEADS
@@ -88,11 +89,28 @@ def _each(items, what):
             yield x
 
 
+def _add_themes(db):
+    """Tracks analyzed before the mood/theme model existed get it from their cached embedding: seconds, not a
+    re-analysis."""
+    old = db.execute("SELECT path, embedding FROM tracks WHERE embedding IS NOT NULL"
+                     " AND json_extract(data, '$.themes') IS NULL").fetchall()
+    if not old:
+        return
+    with _working(f"Adding moods to {len(old)} tracks from the cache"):
+        from .analyze import theme_model
+        themes = theme_model()
+        for p, b in old:
+            db.execute("UPDATE tracks SET data = json_set(data, '$.themes', json(?)) WHERE path = ?",
+                       (json.dumps(themes(np.frombuffer(b, np.float32))), p))
+        db.commit()
+
+
 def analyze_new(db, files, limit=None):
     """Analyzes only new or modified files; a broken file is logged and retried only if it changes."""
     cached = dict(db.execute("SELECT path, mtime FROM tracks"))
     todo = [p for p in files if cached.get(str(p)) != p.stat().st_mtime][:limit]
     print(f"{len(files)} files, {len(files) - len(todo)} already analyzed, {len(todo)} to analyze")
+    _add_themes(db)
     if not todo:
         return
     with _working("Loading models (the first run also downloads them, ~25 MB)"):
@@ -117,7 +135,8 @@ def analyze_new(db, files, limit=None):
 
 def _load(d, manual):
     r = json.loads(d)
-    r["bpm"] = fold_bpm(r["bpm"], r["styles"])  # on read, so improving the rule needs no re-analysis
+    r["bpm"] = fold_bpm(r["bpm"], r["styles"])  # on read, so improving the rules needs no re-analysis
+    r["styles"] = relabel_styles(r["styles"], r["bpm"])
     return apply_manual(r, manual)
 
 
@@ -286,7 +305,7 @@ def _n(x):
 
 
 def export_csv(db, files, out):
-    cols = ["file", "artist", "title", "bpm", "key", "camelot", "energy", "style1", "style2", "style3",
+    cols = ["file", "artist", "title", "bpm", "key", "camelot", "energy", "mood", "style1", "style2", "style3",
             *MOODS, "valence", "arousal", "tags", "error"]
     # BOM + ';' + decimal comma: an Italian-locale Excel opens it right on double click
     with open(out, "w", newline="", encoding="utf-8-sig") as fh:
@@ -298,7 +317,7 @@ def export_csv(db, files, out):
                 w.writerow(head + [""] * (len(cols) - 4) + [err or "not analyzed"])
                 continue
             styles = [f"{s.split('---')[-1]} {round(pr * 100)}%" for s, pr in r["styles"]]
-            w.writerow(head + [_n(r["bpm"]), r["key"], r["camelot"], track_energy(r), *styles,
+            w.writerow(head + [_n(r["bpm"]), r["key"], r["camelot"], track_energy(r), mood_of(r), *styles,
                                *(round(r["moods"][m] * 100) for m in MOODS), _n(r["valence"]), _n(r["arousal"]),
                                " ".join(build_tags(r)), ""])
     print(f"Report: {out}")
@@ -318,6 +337,7 @@ def summary(db, files):
         print(f"  {s:<{width}}  {'█' * max(1, round(n / top * 30))} {n}")
     if len(styles) > 8:
         print(f"  … {len(styles) - 8} more styles")
+    print("  moods: " + " · ".join(f"{m} {n}" for m, n in Counter(mood_of(r) for r in done).most_common()))
     hand, learned = sum(bool(r["manual"]) for r in done), sum(bool(r.get("learned")) for r in done)
     broken = sum(1 for _, r, e in results if e)
     extra = [f"{n} {what}" for n, what in [(hand, "edited by hand"), (learned, "tagged from your examples"),
@@ -337,6 +357,7 @@ def edit(argv):
     ap.add_argument("--bpm", type=float)
     ap.add_argument("--key", help="Camelot key, e.g. 8A")
     ap.add_argument("--energy", type=int, choices=range(1, 11), metavar="1-10")
+    ap.add_argument("--mood", choices=MOOD_GROUPS)
     ap.add_argument("--add", nargs="+", action="extend", default=[], metavar="TAG", help="e.g. --add warmup peak")
     ap.add_argument("--remove", nargs="+", action="extend", default=[], metavar="TAG",
                     help="drop a tag, also one tagwerk found or learned")
@@ -353,8 +374,8 @@ def edit(argv):
         ap.error("no audio files found")
 
     db = open_db(a.db)
-    changes = {k: v for k, v in [("style", a.style), ("bpm", a.bpm), ("key", a.key), ("energy", a.energy)]
-               if v is not None}
+    fields = {"style": a.style, "bpm": a.bpm, "key": a.key, "energy": a.energy, "mood": a.mood}
+    changes = {k: v for k, v in fields.items() if v is not None}
     add, remove = [tag(t) for t in a.add], [tag(t) for t in a.remove]
     if a.reset or changes or add or remove:
         for p in files:
