@@ -17,6 +17,7 @@ Point it at a folder: it listens to every track on your own machine, then sorts 
   <a href="#commands">Commands</a> ·
   <a href="#how-it-sorts">How it sorts</a> ·
   <a href="#fix-it-by-hand">Fix it by hand</a> ·
+  <a href="#rekordbox-and-other-dj-apps">rekordbox</a> ·
   <a href="#troubleshooting">Troubleshooting</a>
 </p>
 
@@ -40,11 +41,12 @@ tagwerk setup
 What a run looks like:
 
 ```
-tagwerk 0.5.0  ~/Music/HardGroove Set → ~/Music/Tagwerk
+tagwerk 0.6.0  ~/Music/HardGroove Set → ~/Music/Tagwerk
 96 tracks · 94 already analyzed · 2 to analyze
 1/2  Ocean Drive.mp3     145.0  8A  #techno #hardgroove #energetic E5
 2/2  Moon Rotation.mp3   138.0  1A  #techno #deep-techno #deep #aggressive E5
 ✓ Sorted  ~/Music/Tagwerk  2 copied, 94 already there
+✓ rekordbox  ~/Music/Tagwerk/rekordbox.xml
 ✓ Report  ~/Music/Tagwerk/tagwerk-report.csv
 
 96 tracks · 121–153 BPM
@@ -95,8 +97,11 @@ Music/
     ├── Tech Trance/
     │   └── Energetic/
     │       └── 140-144 BPM/
+    ├── rekordbox.xml          ← the same folders as rekordbox playlists
     └── tagwerk-report.csv     ← every track: BPM, key, energy, mood, styles, scores, tags
 ```
+
+Every copy carries its BPM, key, style (as genre) and tags (in Comment), so rekordbox, Serato, Traktor or Engine show them straight away.
 
 or with `--compact`, one folder per combination:
 
@@ -104,6 +109,7 @@ or with `--compact`, one folder per combination:
 Tagwerk/
 ├── Techno - Energetic - 140-144 BPM/
 ├── Techno - Melodic - 140-144 BPM/
+├── rekordbox.xml
 └── tagwerk-report.csv
 ```
 
@@ -112,7 +118,7 @@ Tagwerk/
 | Command | What it does |
 |---|---|
 | `tagwerk setup` | Asks a few questions instead of flags, then runs |
-| `tagwerk FOLDER` | Analyzes FOLDER and its subfolders, copies and sorts into `Tagwerk/` next to it, writes the report |
+| `tagwerk FOLDER` | Analyzes FOLDER and its subfolders, copies and sorts into `Tagwerk/` next to it, writes the report and `rekordbox.xml` |
 | `tagwerk edit FILE_OR_FOLDER …` | Fix style, BPM, key, energy or mood by hand, add your own tags ([details](#fix-it-by-hand)) |
 | `tagwerk similar FILE` | The tracks that sound closest, ✓ for the ones you can mix into it |
 | `tagwerk dupes FOLDER` | Tracks saved more than once (another format, bitrate or name) |
@@ -125,9 +131,9 @@ Every command has `--help`.
 |---|---|---|
 | `--by LEVELS` | `style,mood,bpm` | Folder levels, any of `style` `mood` `bpm` `energy` `key` `vocals`, e.g. `--by key,bpm` |
 | `--compact` | off | One folder per combination instead of a nested tree |
-| `--organize OUT` | `Tagwerk/` next to FOLDER | Where the sorted copies and the report go |
+| `--organize OUT` | `Tagwerk/` next to FOLDER | Where the sorted copies, the report and `rekordbox.xml` go |
 | `--csv FILE` | `OUT/tagwerk-report.csv` | Report somewhere else |
-| `--analyze-only` | off | Just analyze: no copies, no report |
+| `--analyze-only` | off | Just analyze: no copies, no report, no XML |
 | `--limit N` | all | Analyze at most N new tracks: try it on a few first |
 | `--jobs N` | half your cores, max 4 | Tracks analyzed at once; lower it if the computer gets sluggish |
 | `--write-tags` | off | Write tags into the Comment field of your **original** files ([details](#tags-in-the-files)) |
@@ -146,11 +152,12 @@ Ctrl‑C stops cleanly at any time: the next run picks up where it left off. Whi
 | `key` | `8A`, `11B`… | Camelot notation |
 | `vocals` | `Vocal`, `Instrumental` | Voice detector |
 
-The copies keep your files, but:
+The copies are your files, plus:
 
+- **Tags**: BPM, key, style as genre, and the tags in Comment (see [below](#tags-in-the-files)). Your originals keep theirs.
 - **Clean names**: copies lose the usual dirt in file name and title tag: track numbers (`22. `, `01 - `), `(Free Download)`, `[FREE DL]`, `PREMIERE:`, `| OUT NOW on …`, `(Official Video)`, `[HQ]`, `[320]`, yt-dlp video ids, underscores. Remixes, mix names, labels and names like `808 State` stay.
 - **Duplicates**: the same track saved twice is copied once, the biggest file (best quality) wins. Nothing is ever deleted.
-- **Updates**: running again copies new tracks, moves a copy whose folder changed (after an edit or a layout switch, removing emptied folders) and refreshes a copy whose original changed.
+- **Updates**: running again copies new tracks, moves a copy whose folder changed (after an edit or a layout switch, removing emptied folders), refreshes a copy whose original changed and re-tags a copy whose tags changed.
 
 ## Fix it by hand
 
@@ -180,9 +187,21 @@ tagwerk dupes ~/Music/playlists          # same track saved more than once, whic
 
 Both work from the cache: instant, no re-analysis.
 
+## rekordbox and other DJ apps
+
+**rekordbox**: each run writes `rekordbox.xml` next to the copies, with a *Tagwerk* folder of playlists that mirrors your folders, plus a *Your tags* folder with one playlist per tag you added by hand or tagwerk learned.
+
+1. rekordbox › *Preferences* › *Advanced* › *Database* › *rekordbox xml* › *Imported Library*: pick `Tagwerk/rekordbox.xml`.
+2. In the sidebar, turn on *rekordbox xml* (*Preferences* › *View* › *Layout*) and open it.
+3. Right click *Tagwerk* › *Import Playlist*. rekordbox analyzes beat grids as usual.
+
+Ran it inside WSL on Windows? Paths like `/mnt/c/…` are written as `C:/…`, so rekordbox on Windows finds the files.
+
+**Serato, Traktor, Engine, Mixxx**: import the `Tagwerk/` folder. BPM, key, genre and comment come from the copies' tags.
+
 ## Tags in the files
 
-Optional, and the only thing that touches your originals. `--write-tags` puts a block like this at the front of each file's Comment field, keeping whatever was there (e.g. Mixed In Key):
+Copies always get tags. Your **originals** only with `--write-tags`, the one option that touches them. Either way the Comment field gets a block like this at the front, keeping whatever was there (e.g. Mixed In Key):
 
 ```
 tw: #techno #hardgroove #energetic #aggressive E6; 8A - Energy 7
@@ -196,7 +215,9 @@ tw: #techno #hardgroove #energetic #aggressive E6; 8A - Energy 7
 | `E6` | Energy 1–10 |
 | your tags | Added by hand or learned; `--remove` beats anything tagwerk found |
 
-**rekordbox**: after writing tags, right click › *Reload Tag* on tracks already in the collection, then build intelligent playlists with *Comments contains* `#hardgroove`.
+Copies also get BPM, key (e.g. `Am`) and the main style as genre.
+
+**rekordbox intelligent playlists**: *Comments contains* `#hardgroove`. After `--write-tags` on tracks already in your collection, right click › *Reload Tag* first.
 
 ## Files and tuning
 

@@ -2,7 +2,12 @@
 import re
 
 import mutagen
+from mutagen.easyid3 import EasyID3
+from mutagen.easymp4 import EasyMP4Tags
 from mutagen.id3 import COMM, ID3
+
+EasyID3.RegisterTextKey("initialkey", "TKEY")  # the key field DJ apps read; mutagen's easy layer lacks it
+EasyMP4Tags.RegisterFreeformKey("initialkey", "initialkey")
 
 # Calibrated on a 96-track hardgroove/techno set (#9); numbers in the comments are from that set.
 # 2nd and 3rd style tags only above this (the 1st always). 0.25 put #tech-trance on 28 tracks, 7 really were
@@ -184,6 +189,28 @@ def merge_comment(existing, tags):
     """Replaces only the 'tw: ...;' block and leaves the rest of the comment (e.g. Mixed In Key) as is."""
     rest = _BLOCK.sub(" ", existing or "", count=1).strip()
     return f"tw: {' '.join(tags)}; {rest}".strip()
+
+
+def key_name(key):
+    """'A minor' -> 'Am', 'F# major' -> 'F#': how ID3's key field and rekordbox write keys. A hand-set Camelot key
+    ('8A') stays as it is."""
+    note, _, scale = key.partition(" ")
+    return note + ("m" if scale == "minor" else "")
+
+
+def write_fields(path, fields):
+    """Sets the easy-tag fields (title, bpm, genre, initialkey…) the file's format supports, skips the others."""
+    f = mutagen.File(path, easy=True)
+    if f is None:
+        raise ValueError("unsupported format")
+    if f.tags is None:
+        f.add_tags()
+    for k, v in fields.items():
+        try:
+            f[k] = v
+        except (KeyError, ValueError, TypeError):  # this format has no such field
+            pass
+    f.save()
 
 
 def update_comment(path, tags):

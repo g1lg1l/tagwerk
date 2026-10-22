@@ -13,6 +13,8 @@ import sqlite3
 import sys
 import threading
 import time
+import urllib.parse
+import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, version
@@ -22,8 +24,8 @@ import mutagen
 import numpy as np
 
 from .tags import (DUPE_MIN, KEY_RE, LAYOUT, LEARN_EXAMPLES, LEARN_MIN, MOOD_GROUPS, apply_manual, build_tags,
-                   clean_filename, clean_title, compatible, fold_bpm, folder_for, mood_of, relabel_styles, tag,
-                   track_energy, update_comment)
+                   clean_filename, clean_title, compatible, fold_bpm, folder_for, key_name, mood_of, relabel_styles,
+                   tag, track_energy, update_comment, write_fields)
 
 AUDIO_EXT = {".mp3", ".wav", ".aiff", ".aif", ".flac", ".m4a", ".ogg"}
 MOODS = ("aggressive", "relaxed", "happy", "sad", "party", "danceable", "voice")  # same keys as analyze.HEADS
@@ -89,7 +91,10 @@ def open_db(path):
                " (path TEXT PRIMARY KEY, mtime REAL, data TEXT, embedding BLOB, error TEXT)")
     # hand edits live apart from the analysis: re-analyzing a track never loses them
     db.execute("CREATE TABLE IF NOT EXISTS manual (path TEXT PRIMARY KEY, data TEXT)")
-    db.execute("CREATE TABLE IF NOT EXISTS copies (dest TEXT PRIMARY KEY, src TEXT)")  # what --organize made
+    # what --organize made; tagged = what was last written into the copy's tags
+    db.execute("CREATE TABLE IF NOT EXISTS copies (dest TEXT PRIMARY KEY, src TEXT, tagged TEXT)")
+    if "tagged" not in [c[1] for c in db.execute("PRAGMA table_info(copies)")]:  # databases from tagwerk < 0.6
+        db.execute("ALTER TABLE copies ADD COLUMN tagged TEXT")
     return db
 
 
@@ -307,19 +312,70 @@ def _place(d, p, old):
     return dest
 
 
-def _fresh_copy(p, dest):
-    """Copies p to dest, then cleans the title tag of the copy (never the original's). The copy keeps p's mtime:
-    that's how the next run tells whether the original changed."""
-    shutil.copy2(p, dest)
+def _style(r):
+    return r["styles"][0][0].split("---")[-1]
+
+
+def _tag_copy(p, dest, r):
+    """Writes what tagwerk knows into its own copy (never the original): clean title, BPM, key, style as genre and
+    the tags in Comment, so any DJ app shows them without analyzing. The copy keeps p's mtime: that's how the
+    next run tells whether the original changed."""
+    _, title = _artist_title(p)
+    fields = {"bpm": str(round(r["bpm"])), "initialkey": key_name(r["key"]), "genre": _style(r)}
+    if title:
+        fields["title"] = clean_title(title)
     try:
-        f = mutagen.File(dest, easy=True)
-        if f is not None and f.get("title") and (title := clean_title(f["title"][0])) != f["title"][0]:
-            f["title"] = title
-            f.save()
+        write_fields(dest, fields)
+        update_comment(dest, build_tags(r))
     except Exception:
-        pass  # untaggable copy: it keeps the title it had
+        pass  # untaggable copy: it stays as it was
     st = p.stat()
     os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+
+def _location(p):
+    """file://localhost/… as rekordbox wants it. Under WSL, /mnt/c/… becomes C:/…: rekordbox runs on Windows."""
+    s = str(p)
+    if m := re.match(r"^/mnt/([a-z])/(.*)", s):
+        s = f"{m[1].upper()}:/{m[2]}"
+    return "file://localhost/" + urllib.parse.quote(s.lstrip("/"), safe="/:")
+
+
+def write_rekordbox(entries, path):
+    """rekordbox.xml: the copies as a collection, plus a Tagwerk folder of playlists mirroring the folders and one
+    playlist per tag of yours. entries: (copy path, result, [folder levels])."""
+    root = ET.Element("DJ_PLAYLISTS", Version="1.0.0")
+    ET.SubElement(root, "PRODUCT", Name="tagwerk", Version=VERSION, Company="")
+    coll = ET.SubElement(root, "COLLECTION", Entries=str(len(entries)))
+    tree, mine = {}, defaultdict(list)  # tree: nested dicts of folder names, leaves are lists of track ids
+    for i, (dest, r, levels) in enumerate(entries, 1):
+        artist, title = _artist_title(dest)
+        ET.SubElement(coll, "TRACK", TrackID=str(i), Name=title or dest.stem, Artist=artist, Genre=_style(r),
+                      TotalTime=str(round(r.get("duration", 0))), AverageBpm=f"{r['bpm']:.2f}",
+                      Tonality=key_name(r["key"]), Comments=" ".join(build_tags(r)), Location=_location(dest))
+        node = tree
+        for name in levels[:-1]:
+            node = node.setdefault(name, {})
+        node.setdefault(levels[-1], []).append(i)
+        for t in r["manual"].get("add", []) + r.get("learned", []):
+            mine[t].append(i)
+    if mine:
+        tree["Your tags"] = dict(sorted(mine.items()))
+
+    def add(parent, name, content):
+        if isinstance(content, list):  # a playlist
+            pl = ET.SubElement(parent, "NODE", Type="1", Name=name, KeyType="0", Entries=str(len(content)))
+            for i in content:
+                ET.SubElement(pl, "TRACK", Key=str(i))
+        else:  # a folder
+            folder = ET.SubElement(parent, "NODE", Type="0", Name=name, Count=str(len(content)))
+            for k in sorted(content):
+                add(folder, k, content[k])
+
+    top = ET.SubElement(ET.SubElement(root, "PLAYLISTS"), "NODE", Type="0", Name="ROOT", Count="1")
+    add(top, "Tagwerk", tree)
+    ET.indent(root)
+    ET.ElementTree(root).write(path, encoding="UTF-8", xml_declaration=True)
 
 
 def _prune(folder, out):
@@ -335,14 +391,14 @@ def organize(db, files, out, by, compact=False):
     cleaned names. Remembers its copies, so a re-run after an edit moves the copy to its new folder and refreshes
     it if the original changed (e.g. --write-tags)."""
     skip = {p for g in find_dupes(db, files) for p in g[1:]}
-    n = Counter()
+    n, entries = Counter(), []
     for p, r, _ in _each(_results(db, files), "Organizing"):
         if not r or p in skip:
             continue  # not analyzed yet (--limit), unreadable, or a duplicate of a better copy
         levels = folder_for(r, by)
         d = out / " - ".join(levels) if compact else out.joinpath(*levels)
         d.mkdir(parents=True, exist_ok=True)
-        mine = [Path(x) for (x,) in db.execute("SELECT dest FROM copies WHERE src = ?", (str(p),))]
+        mine = {Path(x): t for x, t in db.execute("SELECT dest, tagged FROM copies WHERE src = ?", (str(p),))}
         old = next((x for x in mine if x.is_relative_to(out) and x.exists()), None)
         dest = _place(d, p, old)
         moved = old and old != dest  # new folder (an edit, new layout) or new name (cleaning)
@@ -351,22 +407,27 @@ def organize(db, files, out, by, compact=False):
             db.execute("DELETE FROM copies WHERE dest = ?", (str(old),))
             _prune(old.parent, out)
             n["moved or renamed"] += 1
-        if not dest.exists():
-            _fresh_copy(p, dest)
-            n["copied"] += 1
-        elif abs(dest.stat().st_mtime - p.stat().st_mtime) > 2:  # copy2 keeps mtime (FAT/exFAT: to 2 s), so the
-            # original changed since (e.g. --write-tags)
-            _fresh_copy(p, dest)
-            n["updated"] += 1
+        fresh = not dest.exists() or abs(dest.stat().st_mtime - p.stat().st_mtime) > 2  # copy2 keeps mtime (FAT and
+        # exFAT: to 2 s), so a difference means the original changed since (e.g. --write-tags)
+        if fresh:
+            n["copied" if not dest.exists() else "updated"] += 1
+            shutil.copy2(p, dest)
         elif not moved:
             n["already there"] += 1
-        db.execute("REPLACE INTO copies VALUES (?, ?)", (str(dest), str(p)))
+        tagged = json.dumps([round(r["bpm"]), key_name(r["key"]), _style(r), build_tags(r)])
+        if fresh or mine.get(old) != tagged:  # new copy, or an edit / new rule changed what it should say
+            _tag_copy(p, dest, r)
+        db.execute("REPLACE INTO copies VALUES (?, ?, ?)", (str(dest), str(p), tagged))
+        entries.append((dest, r, [" - ".join(levels)] if compact else levels))
     db.commit()
     n["duplicates skipped"] = len(skip)
     counts = ", ".join(f"{v} {k}" for k, v in n.items() if v) or "nothing to do"
     print(f"{_c(GREEN, '✓')} Sorted  {_c(BOLD, _home(out))}  {_c(DIM, counts)}")
     if skip:
         print(_c(DIM, "          tagwerk dupes <folder> lists the duplicates"))
+    if entries:
+        write_rekordbox(entries, out / "rekordbox.xml")
+        print(f"{_c(GREEN, '✓')} rekordbox  {_c(BOLD, _home(out / 'rekordbox.xml'))}")
 
 
 def _artist_title(p):

@@ -9,9 +9,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np  # noqa: E402
 
-from tagwerk.cli import MOODS, _results, edit, find_dupes, main, open_db, organize, summary  # noqa: E402
+from tagwerk.cli import (MOODS, _location, _results, edit, find_dupes, main, open_db, organize,  # noqa: E402
+                         summary)
 from tagwerk.tags import (apply_manual, build_tags, camelot, clean_filename, clean_title, compatible,  # noqa: E402
-                          energy, fold_bpm, folder_for, merge_comment, relabel_styles, tag)
+                          energy, fold_bpm, folder_for, key_name, merge_comment, relabel_styles, tag)
 
 THEMES = dict.fromkeys(["energetic", "melodic", "deep", "dark", "emotional", "sad", "melancholic", "groovy",
                         "uplifting"], 0.01)
@@ -109,7 +110,8 @@ def test_organize_copies_without_overwriting():
             (tmp / "in" / name).parent.mkdir(parents=True)
             (tmp / "in" / name).write_bytes(data)
         paths = [tmp / "in" / name for name in files]
-        r = {"styles": [("Electronic---Techno", 0.9)], "bpm": 140.0}
+        r = {"styles": [("Electronic---Techno", 0.9)], "bpm": 140.0, "key": "A minor", "camelot": "8A",
+             "arousal": 5.0, "moods": dict.fromkeys(MOODS, 0.0)}
         db = open_db(":memory:")
         for p in paths[:3]:  # d/new.mp3 is not analyzed yet
             db.execute("INSERT INTO tracks VALUES (?, 0, ?, NULL, NULL)", (str(p), json.dumps(r)))
@@ -131,7 +133,8 @@ def _library(tmp, tracks):
         p = tmp / "in" / name
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(data)
-        r = {"styles": [(f"Electronic---{style}", 0.9)], "bpm": 140.0, "duration": 300.0}
+        r = {"styles": [(f"Electronic---{style}", 0.9)], "bpm": 140.0, "duration": 300.0, "key": "A minor",
+             "camelot": "8A", "arousal": 5.0, "moods": dict.fromkeys(MOODS, 0.0)}
         db.execute("INSERT INTO tracks VALUES (?, 0, ?, ?, NULL)",
                    (str(p), json.dumps(r), np.array(vec, np.float32).tobytes()))
         paths.append(p)
@@ -166,9 +169,35 @@ def test_organize_clean_names_and_compact():
         organize(db, [p], out, ["style", "bpm"])
         assert [str(f.relative_to(out)) for f in out.rglob("*.mp3")] == ["Techno/140-144 BPM/Artist - Track.mp3"]
         organize(db, [p], out, ["style", "bpm"], compact=True)  # switching layout moves the copy, no leftovers
-        assert [str(f.relative_to(out)) for f in out.rglob("*")] == ["Techno - 140-144 BPM",
-                                                                    "Techno - 140-144 BPM/Artist - Track.mp3"]
+        assert sorted(str(f.relative_to(out)) for f in out.rglob("*")) == [
+            "Techno - 140-144 BPM", "Techno - 140-144 BPM/Artist - Track.mp3", "rekordbox.xml"]
         assert p.exists() and p.name.startswith("07. ")  # original untouched
+
+
+def test_rekordbox_xml():
+    import xml.etree.ElementTree as ET
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        db, paths = _library(tmp, {"a/one.mp3": (b"1", [1, 0], "Techno"), "a/two two.mp3": (b"22", [0, 1], "House")})
+        db.execute("INSERT INTO manual VALUES (?, ?)", (str(paths[1]), json.dumps({"add": ["#warmup"]})))
+        out = tmp / "out"
+        organize(db, paths, out, ["style", "bpm"])
+        root = ET.parse(out / "rekordbox.xml").getroot()
+        tracks = {t.get("Name"): t for t in root.iter("TRACK") if t.get("Name")}
+        assert tracks["two two"].get("Location").endswith("/out/House/140-144%20BPM/two%20two.mp3")
+        assert tracks["one"].get("Tonality") == "Am" and tracks["one"].get("AverageBpm") == "140.00"
+        tw = root.find("PLAYLISTS/NODE/NODE")
+        assert tw.get("Name") == "Tagwerk"
+        names = [n.get("Name") for n in tw.iter("NODE")]
+        assert names == ["Tagwerk", "House", "140-144 BPM", "Techno", "140-144 BPM", "Your tags", "#warmup"]
+        warmup = next(n for n in tw.iter("NODE") if n.get("Name") == "#warmup")
+        assert [t.get("Key") for t in warmup] == [tracks["two two"].get("TrackID")]
+
+
+def test_location_and_key_name():
+    assert _location(Path("/Users/me/My Music/a&b.mp3")) == "file://localhost/Users/me/My%20Music/a%26b.mp3"
+    assert _location(Path("/mnt/c/Users/me/x.mp3")) == "file://localhost/C:/Users/me/x.mp3"  # WSL -> Windows
+    assert key_name("A minor") == "Am" and key_name("F# major") == "F#" and key_name("8A") == "8A"
 
 
 def test_dupes_copied_once():
