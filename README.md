@@ -41,7 +41,7 @@ tagwerk setup
 What a run looks like:
 
 ```
-tagwerk 0.7.0  ~/Music/HardGroove Set → ~/Music/Tagwerk
+tagwerk 0.8.0  ~/Music/HardGroove Set → ~/Music/Tagwerk
 96 tracks · 94 already analyzed · 2 to analyze
 1/2  Ocean Drive.mp3     145.0  8A  #techno #hardgroove #energetic E5
 2/2  Moon Rotation.mp3   138.0  1A  #techno #deep-techno #deep #aggressive E5
@@ -64,9 +64,11 @@ tagwerk is a command-line tool. Install it once and `tagwerk` works from any fol
 
 | System | How |
 |---|---|
-| **macOS** (Apple Silicon or Intel) | `uv tool install --python 3.12 git+https://github.com/g1lg1l/tagwerk` |
-| **Linux** | same command |
-| **Windows** | Essentia doesn't run on Windows itself: install [WSL2](https://learn.microsoft.com/windows/wsl/install) (Ubuntu), then the same command inside it. Your Windows folders are under `/mnt/c/Users/<you>/…` |
+| **macOS** (Apple Silicon: macOS 15+, Intel: macOS 14+) | `uv tool install --python 3.12 git+https://github.com/g1lg1l/tagwerk` |
+| **Linux** (x86_64) | same command |
+| **Windows** | Essentia doesn't run on Windows itself: install [WSL2](https://learn.microsoft.com/windows/wsl/install) (Ubuntu, x86_64), then the same command inside it. Your Windows folders are under `/mnt/c/Users/<you>/…` |
+
+Older macOS versions and ARM Linux have no Essentia build, so the install stops there.
 
 | To… | Run |
 |---|---|
@@ -157,8 +159,12 @@ The copies are your files, plus:
 
 - **Tags**: BPM, key, style as genre, and the tags in Comment (see [below](#tags-in-the-files)). Your originals keep theirs.
 - **Clean names**: copies lose the usual dirt in file name and title tag: track numbers (`22. `, `01 - `), `(Free Download)`, `[FREE DL]`, `PREMIERE:`, `| OUT NOW on …`, `(Official Video)`, `[HQ]`, `[320]`, yt-dlp video ids, underscores. Remixes, mix names, labels and names like `808 State` stay.
-- **Duplicates**: the same track saved twice is copied once, the biggest file (best quality) wins. Nothing is ever deleted.
-- **Updates**: running again copies new tracks, moves a copy whose folder changed (after an edit or a layout switch, removing emptied folders), refreshes a copy whose original changed and re-tags a copy whose tags changed.
+- **Duplicates**: the same track saved twice is copied once, the biggest file (best quality) wins; when a better file arrives later (the FLAC of an mp3), the old copy is replaced. Your originals are never deleted.
+- **Updates**: running again copies new tracks, moves a copy whose folder changed (after an edit or a layout switch, removing emptied folders), re-tags a copy whose tags changed, and refreshes a copy whose original is newer (e.g. after `--write-tags`).
+- **Your DJ app's work is kept**: a copy that Serato, Traktor or Mixed In Key changed (cues, beat grids, tags) is newer than its original, so tagwerk doesn't overwrite it.
+- **Moved or renamed folders**: rename `Set A` to `Set A 2026` or move it to another drive and tagwerk recognizes the tracks (same name and date): no re-analysis, your edits and copies stay.
+- **Several sets, one `Tagwerk/`**: the report and `rekordbox.xml` list every set sorted there, not just the last one.
+- **Interrupted?** Ctrl‑C or a full disk never leaves a half-copied track under its real name; run again to finish.
 
 ## Fix it by hand
 
@@ -182,12 +188,16 @@ tagwerk edit ".../track.mp3" --reset
 ## Search, similar tracks, duplicates
 
 ```bash
-tagwerk search "dark hardgroove"            # every word must fit; the best matches first
+tagwerk search "dark hardgroove"
 tagwerk search melodic tech trance 138-142
-tagwerk search deep techno 8A #warmup       # 8A: tracks that mix with it; #tags you added or tagwerk learned
-tagwerk similar ".../track.mp3" -n 10       # closest-sounding tracks, ✓ = within ±6% BPM and a compatible key
-tagwerk dupes ~/Music/playlists             # same track saved more than once, which one gets copied
+tagwerk search deep techno 8A "#warmup"
+tagwerk similar ".../track.mp3" -n 10
+tagwerk dupes ~/Music/playlists
 ```
+
+- **search**: every word must fit, the best matches first. `8A` means tracks that mix with it; `#tags` are the ones you added or tagwerk learned (quote them: the shell treats an unquoted `#` as a comment).
+- **similar**: the closest-sounding tracks; ✓ = within ±6% BPM and a compatible key. A copy from `Tagwerk/` works too.
+- **dupes**: the same track saved more than once, and which file gets copied.
 
 `search` knows the 400 style names (`dub techno`, `acid`, `hardgroove`, `dnb`…), the 56 mood labels (`dark`, `deep`, `melodic`, `emotional`, `groovy`, `energetic`…), `aggressive`, `chill`, `vocal`, `instrumental`, BPM (`140` = 137–143, or `138-142`), Camelot keys and `#tags`. Words it doesn't know are shown, not guessed.
 
@@ -200,6 +210,8 @@ All three work from the cache: instant, no re-analysis.
 1. rekordbox › *Preferences* › *Advanced* › *Database* › *rekordbox xml* › *Imported Library*: pick `Tagwerk/rekordbox.xml`.
 2. In the sidebar, turn on *rekordbox xml* (*Preferences* › *View* › *Layout*) and open it.
 3. Right click *Tagwerk* › *Import Playlist*. rekordbox analyzes beat grids as usual.
+
+Once you've set cues, keep the layout: an edit or a layout change moves copies, and rekordbox then shows them as missing. Use *Relocate* on them (it keeps your cues) rather than importing them again.
 
 Ran it inside WSL on Windows? Paths like `/mnt/c/…` are written as `C:/…`, so rekordbox on Windows finds the files.
 
@@ -252,7 +264,7 @@ Thresholds and vocabularies live at the top of [`tagwerk/tags.py`](tagwerk/tags.
 ```bash
 git clone https://github.com/g1lg1l/tagwerk && cd tagwerk
 uv tool install --python 3.12 -e .
-python tests/test_tagwerk.py      # needs numpy and mutagen, not Essentia
+uv run --no-project --with numpy --with mutagen python tests/test_tagwerk.py   # no Essentia needed
 ```
 
 ## Models

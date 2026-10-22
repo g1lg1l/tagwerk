@@ -1,6 +1,7 @@
 """tagwerk <folder>: analyzes tracks (cached), organizes copies into subfolders, exports CSV, writes tags on request.
 tagwerk setup: a few questions instead of flags. tagwerk edit <file|folder>: hand corrections and personal tags.
-tagwerk similar <file>: tracks that sound alike. tagwerk dupes <folder>: tracks saved more than once."""
+tagwerk similar <file>: tracks that sound alike. tagwerk search <words>: find tracks.
+tagwerk dupes <folder>: tracks saved more than once."""
 import argparse
 import csv
 import itertools
@@ -13,6 +14,8 @@ import sqlite3
 import sys
 import threading
 import time
+import unicodedata
+import urllib.error
 import urllib.parse
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
@@ -24,8 +27,8 @@ import mutagen
 import numpy as np
 
 from .tags import (DUPE_MIN, KEY_RE, LAYOUT, LEARN_EXAMPLES, LEARN_MIN, MOOD_GROUPS, apply_manual, build_tags,
-                   clean_filename, clean_title, compatible, fold_bpm, folder_for, key_name, mood_of, relabel_styles,
-                   tag, track_energy, update_comment, write_fields)
+                   clean_filename, clean_title, compatible, fold_bpm, folder_for, key_name, mood_of, read_fields,
+                   relabel_styles, tag, track_energy, update_comment, write_fields)
 
 AUDIO_EXT = {".mp3", ".wav", ".aiff", ".aif", ".flac", ".m4a", ".ogg"}
 MOODS = ("aggressive", "relaxed", "happy", "sad", "party", "danceable", "voice")  # same keys as analyze.HEADS
@@ -98,12 +101,35 @@ def open_db(path):
     return db
 
 
+def disk_path(target):
+    """The absolute path as the disk spells it: symlinks resolved, and every name with the disk's letter case and
+    accents (macOS stores 'û' decomposed, a typed or pasted path has it composed). Cache keys must match exactly."""
+    p = Path(os.path.realpath(os.path.expanduser(target)))
+    out = Path(p.anchor)
+    for part in p.parts[1:]:
+        try:
+            names = os.listdir(out)
+        except OSError:
+            names = []
+        if part not in names:
+            want = unicodedata.normalize("NFC", part).casefold()
+            part = next((n for n in names if unicodedata.normalize("NFC", n).casefold() == want), part)
+        out /= part
+    return out
+
+
+def _hidden(parts):
+    """macOS '._x.mp3' twins, .Trashes, .Spotlight… and Windows' recycle bin: never music."""
+    return any(s.startswith(".") or s.upper() == "$RECYCLE.BIN" for s in parts)
+
+
 def audio_files(target):
-    """A file, or every audio file under a folder. Absolute paths, so the cache works from any directory."""
-    p = Path(os.path.abspath(target))
+    """A file, or every audio file under a folder, spelled as on disk, so the cache works from any directory."""
+    p = disk_path(target)
     if p.is_file():
         return [p]
-    return sorted(f for f in p.rglob("*") if f.suffix.lower() in AUDIO_EXT)
+    return sorted(f for f in p.rglob("*")
+                  if f.suffix.lower() in AUDIO_EXT and not _hidden(f.relative_to(p).parts) and f.is_file())
 
 
 def _duration(s):
@@ -173,11 +199,40 @@ def _add_themes(db):
         db.commit()
 
 
+def _mtimes(files):
+    """One stat per file, at scan time: a file renamed or deleted meanwhile is just left out."""
+    out = {}
+    for p in files:
+        try:
+            out[p] = p.stat().st_mtime
+        except OSError:
+            pass
+    return out
+
+
+def _rehome(db, mtimes):
+    """A renamed or moved set folder keeps its analysis, hand edits and copies: a path that's gone, with the same
+    file name and mtime as a new one, is the same file."""
+    cached = dict(db.execute("SELECT path, mtime FROM tracks"))
+    gone = {(Path(q).name, m): q for q, m in cached.items() if not os.path.exists(q)}
+    moved = 0
+    for p, m in mtimes.items():
+        if str(p) not in cached and (old := gone.pop((p.name, m), None)):
+            for table, col in (("tracks", "path"), ("manual", "path"), ("copies", "src")):
+                db.execute(f"UPDATE OR IGNORE {table} SET {col} = ? WHERE {col} = ?", (str(p), old))
+            moved += 1
+    db.commit()
+    if moved:
+        print(_c(DIM, f"{moved} tracks moved or renamed since last time: kept their analysis and edits"))
+
+
 def analyze_new(db, files, limit=None, jobs=JOBS):
     """Analyzes only new or modified files, `jobs` at a time; a broken file is logged and retried only if it
     changes."""
+    mtimes = _mtimes(files)
+    _rehome(db, mtimes)
     cached = dict(db.execute("SELECT path, mtime FROM tracks"))
-    new = [p for p in files if cached.get(str(p)) != p.stat().st_mtime]
+    new = [p for p, m in mtimes.items() if cached.get(str(p)) != m]
     todo = new[:limit]
     later = f" (--limit: {len(new) - len(todo)} left for next time)" if len(todo) < len(new) else ""
     print(f"{_c(BOLD, len(files))} tracks · {len(files) - len(new)} already analyzed · "
@@ -188,36 +243,49 @@ def analyze_new(db, files, limit=None, jobs=JOBS):
     with _working("Getting the models ready (the first run downloads them, ~30 MB)"), _quiet_native():
         from . import analyze  # heavy import (TensorFlow): only when needed
         analyze.fetch_models()
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from concurrent.futures.process import BrokenProcessPool
     from multiprocessing import get_context
     jobs = max(1, min(jobs, len(todo)))
     # each worker's TensorFlow would grab every core; sharing them out beats letting them fight (inherited by spawn)
     os.environ.setdefault("TF_NUM_INTRAOP_THREADS", str(max(1, (os.cpu_count() or 2) // jobs)))
     os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
     start, width, digits = time.monotonic(), min(40, max(len(p.name) for p in todo)), len(str(len(todo)))
-    # spawn: TensorFlow doesn't survive fork; the workers inherit the muted stderr
-    with _quiet_native(), get_context("spawn").Pool(jobs, initializer=analyze.init_worker) as pool, \
+    # spawn: TensorFlow doesn't survive fork; the workers inherit the muted stderr. An executor, not a Pool: a
+    # worker that dies (out of memory, a native crash) ends the run with a message instead of hanging it
+    with _quiet_native(), ProcessPoolExecutor(jobs, mp_context=get_context("spawn"),
+                                              initializer=analyze.init_worker) as pool, \
             _working(f"Loading models in {jobs} worker{'s' * (jobs > 1)}") as status:
-        for i, (p, r, err) in enumerate(pool.imap_unordered(analyze.analyze_file, todo), 1):
-            if r:
-                emb = r.pop("embedding")
-                db.execute("REPLACE INTO tracks VALUES (?, ?, ?, ?, NULL)",
-                           (str(p), p.stat().st_mtime, json.dumps(r), emb))
-                r = _load(json.dumps(r), {})  # as every other command sees it: half-time fixed, styles relabelled
-                bpm, key, tags = f"{r['bpm']:5.1f}", f"{r['camelot']:>3}", " ".join(build_tags(r))
-                line = f"{_c(BOLD, bpm)} {_c(CYAN, key)}  {_c(DIM, tags)}"
-            else:
-                db.execute("REPLACE INTO tracks VALUES (?, ?, NULL, NULL, ?)", (str(p), p.stat().st_mtime, err))
-                line = _c(RED, f"✗ {err}")
-            db.commit()
-            left = (time.monotonic() - start) / i * (len(todo) - i)
-            status[0] = f"Analyzing {jobs} at a time" + (f" · {_duration(left)} left" if i < len(todo) else "")
-            _say(f"{_c(DIM, f'{i:>{digits}}/{len(todo)}')}  {_fit(p.name, width)}  {line}")
+        futures = [pool.submit(analyze.analyze_file, p) for p in todo]
+        try:
+            for i, f in enumerate(as_completed(futures), 1):
+                p, r, err = f.result()
+                if r:
+                    emb = r.pop("embedding")
+                    db.execute("REPLACE INTO tracks VALUES (?, ?, ?, ?, NULL)", (str(p), mtimes[p], json.dumps(r), emb))
+                    r = _load(json.dumps(r), {})  # as every other command sees it: half-time fixed, styles relabelled
+                    bpm, key, tags = f"{r['bpm']:5.1f}", f"{r['camelot']:>3}", " ".join(build_tags(r))
+                    line = f"{_c(BOLD, bpm)} {_c(CYAN, key)}  {_c(DIM, tags)}"
+                else:
+                    db.execute("REPLACE INTO tracks VALUES (?, ?, NULL, NULL, ?)", (str(p), mtimes[p], err))
+                    line = _c(RED, f"✗ {err}")
+                db.commit()
+                left = (time.monotonic() - start) / i * (len(todo) - i)
+                status[0] = f"Analyzing {jobs} at a time" + (f" · {_duration(left)} left" if i < len(todo) else "")
+                _say(f"{_c(DIM, f'{i:>{digits}}/{len(todo)}')}  {_fit(p.name, width)}  {line}")
+        except BrokenProcessPool:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise SystemExit(f"\n{_c(RED, 'A worker crashed or could not load the models')} (out of memory? try "
+                             "--jobs 1). Everything analyzed so far is saved: run again to resume.")
+        except KeyboardInterrupt:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
 
 
 def _load(d, manual):
     r = json.loads(d)
     r["bpm"] = fold_bpm(r["bpm"], r["styles"])  # on read, so improving the rules needs no re-analysis
-    r["styles"] = relabel_styles(r["styles"], r["bpm"])
+    r["styles"] = relabel_styles(r["styles"], manual.get("bpm", r["bpm"]))
     return apply_manual(r, manual)
 
 
@@ -234,7 +302,10 @@ def _learn(db, rows, manual):
     """Personal categories (#11): every track you never hand-tagged takes the hand tags of its most similar
     hand-tagged track. A track where you only removed tags counts as a "none of these" example."""
     # ponytail: 1-nearest-neighbour, a per-tag classifier if it turns out noisy on a real library
-    labeled = [p for p, m in manual.items() if ("add" in m or "remove" in m) and rows.get(p, (None,))[0]]
+    examples = Counter(t for m in manual.values() for t in m.get("add", []))
+    # removing an automatic tag (a false #vocal) is a correction, not a "none of your tags" example
+    labeled = [p for p, m in manual.items()
+               if (m.get("add") or set(m.get("remove", [])) & set(examples)) and rows.get(p, (None,))[0]]
     if not labeled:
         return
     emb = _embeddings(db)
@@ -243,7 +314,6 @@ def _learn(db, rows, manual):
     others = [p for p, (r, _) in rows.items() if r and p in emb and p not in skip]
     if not labeled or not others:
         return
-    examples = Counter(t for m in manual.values() for t in m.get("add", []))
     sims = np.stack([emb[p] for p in others]) @ np.stack([emb[p] for p in labeled]).T
     for p, row in zip(others, sims):
         if row.max() >= LEARN_MIN:
@@ -261,6 +331,13 @@ def _results(db, files):
 
 def write_tags(db, files):
     """Writes tags into Comment. Tags are recomputed from the cache, so changing thresholds needs no re-analysis."""
+    same = defaultdict(list)  # the same file under two paths (a hardlink, a symlink): updated together
+    for p in files:
+        try:
+            st = p.stat()
+            same[st.st_dev, st.st_ino].append(p)
+        except OSError:
+            pass
     for p, r, _ in _results(db, files):
         if not r or r.get("written") == (tags := build_tags(r)):
             continue
@@ -270,8 +347,9 @@ def write_tags(db, files):
             print(_c(RED, f"✗ {p.name}: tags not written ({e})"), file=sys.stderr)
             continue
         # store the new mtime, otherwise next run would see the file as modified and re-analyze it
-        db.execute("UPDATE tracks SET data = json_set(data, '$.written', json(?)), mtime = ? WHERE path = ?",
-                   (json.dumps(tags), p.stat().st_mtime, str(p)))
+        st = p.stat()
+        db.executemany("UPDATE tracks SET data = json_set(data, '$.written', json(?)), mtime = ? WHERE path = ?",
+                       [(json.dumps(tags), st.st_mtime, str(q)) for q in same[st.st_dev, st.st_ino] or [p]])
         db.commit()
         print(f"{_c(GREEN, '✎')} {p.name}  {_c(DIM, ' '.join(tags))}")
 
@@ -307,9 +385,17 @@ def _place(d, p, old):
     old (our previous copy) counts as free, so a copy already in the right place stays put."""
     name = Path(clean_filename(p))
     dest, n = d / name, 2
-    while dest.exists() and dest != old and dest.stat().st_size != p.stat().st_size:
+    while dest.exists() and not _same(dest, old) and dest.stat().st_size != p.stat().st_size:
         dest, n = d / f"{name.stem} ({n}){name.suffix}", n + 1  # never overwrite
-    return dest
+    return old if _same(dest, old) else dest
+
+
+def _same(a, b):
+    """Same file on disk: 'Techno/x.mp3' and 'techno/x.mp3' are one file on macOS and Windows."""
+    try:
+        return b is not None and a.samefile(b)
+    except OSError:
+        return False
 
 
 def _style(r):
@@ -327,8 +413,8 @@ def _tag_copy(p, dest, r):
     try:
         write_fields(dest, fields)
         update_comment(dest, build_tags(r))
-    except Exception:
-        pass  # untaggable copy: it stays as it was
+    except Exception as e:  # untaggable copy: it stays as it was
+        _say(_c(YELLOW, f"! couldn't tag {dest.name}: {e}"))
     st = p.stat()
     os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns))
 
@@ -374,16 +460,38 @@ def write_rekordbox(entries, path):
 
     top = ET.SubElement(ET.SubElement(root, "PLAYLISTS"), "NODE", Type="0", Name="ROOT", Count="1")
     add(top, "Tagwerk", tree)
+    for el in root.iter():  # one control character in a tag would make the whole file unreadable for rekordbox
+        for k, v in el.attrib.items():
+            el.attrib[k] = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", v)
     ET.indent(root)
     ET.ElementTree(root).write(path, encoding="UTF-8", xml_declaration=True)
 
 
+_OS_JUNK = {".DS_Store", "Thumbs.db", "desktop.ini"}
+
+
 def _prune(folder, out):
-    """Removes folders a move left empty, up to out."""
+    """Removes folders a move left empty (Finder's .DS_Store and Explorer's Thumbs.db don't count), up to out."""
     for f in [folder, *folder.parents]:
-        if f == out or not f.is_relative_to(out) or any(f.iterdir()):
+        if f == out or not f.is_relative_to(out) or not f.exists():
             return
+        if any(x.name not in _OS_JUNK for x in f.iterdir()):
+            return
+        for x in f.iterdir():
+            x.unlink()
         f.rmdir()
+
+
+def _copy(p, dest):
+    """Through a .part file: an interrupted copy (Ctrl-C, a full disk) never leaves a truncated track under the real
+    name for a DJ app to import. A .part isn't audio, so no scan ever picks it up."""
+    tmp = dest.with_name(dest.name + ".part")
+    try:
+        shutil.copy2(p, tmp)
+        tmp.replace(dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def organize(db, files, out, by, compact=False):
@@ -392,6 +500,14 @@ def organize(db, files, out, by, compact=False):
     it if the original changed (e.g. --write-tags)."""
     skip = {p for g in find_dupes(db, files) for p in g[1:]}
     n, entries = Counter(), []
+    # a better file of a track arrived (the FLAC of an mp3): its old copy goes, the original is still there
+    for dest, src in db.execute("SELECT dest, src FROM copies").fetchall():
+        if Path(src) in skip and Path(dest).is_relative_to(out):
+            Path(dest).unlink(missing_ok=True)
+            db.execute("DELETE FROM copies WHERE dest = ?", (dest,))
+            _prune(Path(dest).parent, out)
+            n["replaced by a better file"] += 1
+    db.commit()
     for p, r, _ in _each(_results(db, files), "Organizing"):
         if not r or p in skip:
             continue  # not analyzed yet (--limit), unreadable, or a duplicate of a better copy
@@ -407,19 +523,21 @@ def organize(db, files, out, by, compact=False):
             db.execute("DELETE FROM copies WHERE dest = ?", (str(old),))
             _prune(old.parent, out)
             n["moved or renamed"] += 1
-        fresh = not dest.exists() or abs(dest.stat().st_mtime - p.stat().st_mtime) > 2  # copy2 keeps mtime (FAT and
-        # exFAT: to 2 s), so a difference means the original changed since (e.g. --write-tags)
+        # copy2 keeps the original's mtime (FAT/exFAT: to 2 s). Only an original NEWER than its copy (--write-tags,
+        # a re-download) refreshes it: a copy changed by Serato, Traktor or Mixed In Key (cues, grids) is theirs
+        fresh = not dest.exists() or p.stat().st_mtime - dest.stat().st_mtime > 2
         if fresh:
             n["copied" if not dest.exists() else "updated"] += 1
-            shutil.copy2(p, dest)
+            _copy(p, dest)
         elif not moved:
             n["already there"] += 1
-        tagged = json.dumps([round(r["bpm"]), key_name(r["key"]), _style(r), build_tags(r)])
+        title = clean_title(_artist_title(p)[1])
+        tagged = json.dumps([round(r["bpm"]), key_name(r["key"]), _style(r), build_tags(r), title])
         if fresh or mine.get(old) != tagged:  # new copy, or an edit / new rule changed what it should say
             _tag_copy(p, dest, r)
         db.execute("REPLACE INTO copies VALUES (?, ?, ?)", (str(dest), str(p), tagged))
+        db.commit()  # per track: an interrupted run keeps what it did, and other tagwerk commands aren't locked out
         entries.append((dest, r, [" - ".join(levels)] if compact else levels))
-    db.commit()
     n["duplicates skipped"] = len(skip)
     counts = ", ".join(f"{v} {k}" for k, v in n.items() if v) or "nothing to do"
     print(f"{_c(GREEN, '✓')} Sorted  {_c(BOLD, _home(out))}  {_c(DIM, counts)}")
@@ -431,11 +549,7 @@ def organize(db, files, out, by, compact=False):
 
 
 def _artist_title(p):
-    try:
-        t = mutagen.File(p, easy=True)
-        return (t.get("artist") or [""])[0], (t.get("title") or [""])[0]
-    except Exception:
-        return "", ""
+    return tuple(read_fields(p))
 
 
 def _n(x):
@@ -446,6 +560,7 @@ def export_csv(db, files, out):
     cols = ["file", "artist", "title", "bpm", "key", "camelot", "energy", "mood", "style1", "style2", "style3",
             *MOODS, "valence", "arousal", "tags", "error"]
     # BOM + ';' + decimal comma: an Italian-locale Excel opens it right on double click
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh, delimiter=";")
         w.writerow(cols)
@@ -485,6 +600,24 @@ def summary(db, files):
         print(_c(DIM, "  " + " · ".join(extra)))
 
 
+def _originals(db, files):
+    """A sorted copy in Tagwerk/ (the file Finder and DJ apps hand out) stands for its original."""
+    src = dict(db.execute("SELECT dest, src FROM copies"))
+    return list(dict.fromkeys(Path(src.get(str(f.resolve()), f)) for f in files))
+
+
+def _known_style(db, style):
+    """The spelling the library already uses: 'dub techno' -> 'Dub Techno', so one style stays one folder."""
+    names = {}
+    for (d,) in db.execute("SELECT data FROM tracks WHERE data IS NOT NULL"):
+        for s, _ in json.loads(d)["styles"]:
+            names.setdefault(s.split("---")[-1].lower(), s.split("---")[-1])
+    for (m,) in db.execute("SELECT data FROM manual"):
+        if "style" in (m := json.loads(m)):
+            names.setdefault(m["style"].lower(), m["style"])
+    return names.get(style.lower(), style)
+
+
 def edit(argv):
     ap = argparse.ArgumentParser(
         prog="tagwerk edit",
@@ -496,7 +629,7 @@ def edit(argv):
     ap.add_argument("--bpm", type=float)
     ap.add_argument("--key", help="Camelot key, e.g. 8A")
     ap.add_argument("--energy", type=int, choices=range(1, 11), metavar="1-10")
-    ap.add_argument("--mood", choices=MOOD_GROUPS)
+    ap.add_argument("--mood", type=str.capitalize, choices=MOOD_GROUPS)
     ap.add_argument("--add", nargs="+", action="extend", default=[], metavar="TAG", help="e.g. --add warmup peak")
     ap.add_argument("--remove", nargs="+", action="extend", default=[], metavar="TAG",
                     help="drop a tag, also one tagwerk found or learned")
@@ -513,6 +646,8 @@ def edit(argv):
         ap.error("no audio files found")
 
     db = open_db(a.db)
+    files = _originals(db, files)
+    a.style = a.style and _known_style(db, a.style)
     fields = {"style": a.style, "bpm": a.bpm, "key": a.key, "energy": a.energy, "mood": a.mood}
     changes = {k: v for k, v in fields.items() if v is not None}
     add, remove = [tag(t) for t in a.add], [tag(t) for t in a.remove]
@@ -545,7 +680,7 @@ def similar(argv):
     ap.add_argument("--db", default=DB)
     a = ap.parse_args(argv)
     db = open_db(a.db)
-    emb, me = _embeddings(db), os.path.abspath(a.file)
+    emb, me = _embeddings(db), str(_originals(db, [disk_path(a.file)])[0])
     if me not in emb:
         ap.error(f"{a.file} is not analyzed yet: run tagwerk on its folder first")
     paths = [p for p in emb if p != me and Path(p).exists()]
@@ -565,15 +700,17 @@ def similar(argv):
 
 # words that only make a query read well
 _STOP = {"a", "an", "and", "the", "with", "some", "of", "in", "for", "track", "tracks", "song", "songs", "music",
-         "vibe", "vibes", "style", "kind", "like", "very", "bit", "little", "really"}
+         "vibe", "vibes", "style", "kind", "like", "very", "bit", "little", "really", "bpm"}
 DNB = ("drum", "n", "bass")
 _ALIASES = {("hardgroove",): ("schranz",),  # the model's name for it (shown as Hardgroove below 150 BPM)
-            ("dnb",): DNB, ("d&b",): DNB, ("drum", "and", "bass"): DNB,
+            ("dnb",): DNB, ("d&b",): DNB, ("drum", "and", "bass"): DNB, ("drum", "&", "bass"): DNB,
+            ("drum&bass",): DNB,
             ("chill",): ("relaxed",), ("sad",): ("emotional",)}
 
 
 def _words(text):
-    return tuple(re.findall(r"[a-z0-9#&]+", text.lower()))
+    """#tags whole (#warm-up, #già), BPM ranges whole (138-142), everything else by word."""
+    return tuple(re.findall(r"#[^\s#]+|\d{2,3}-\d{2,3}|[a-z0-9&]+", text.lower()))
 
 
 def search_scores(query, results, styles, style_names):
@@ -598,6 +735,13 @@ def search_scores(query, results, styles, style_names):
                        ("party", "party"), ("danceable", "danceable")]:
         concept((word,), np.array([r["moods"][mood] for r in results]))
     concept(("instrumental",), 1 - concepts[("vocal",)])
+    style_phrases = {_words(n.split("---")[-1]) for n in style_names}
+    for k, r in enumerate(results):  # a hand-set style or mood counts as a perfect score for that track
+        for v in (r["manual"].get("style"), r["manual"].get("mood")):
+            if v:
+                w = _ALIASES.get(_words(v), _words(v))
+                concepts[w] = concepts.get(w, np.zeros(len(results))).copy()
+                concepts[w][k] = concepts[w].max() or 1
 
     words, i, terms, keep, understood, ignored = _words(query), 0, [], np.ones(len(results), bool), [], []
     while i < len(words):
@@ -605,7 +749,7 @@ def search_scores(query, results, styles, style_names):
             phrase = words[i:i + size]
             phrase = _ALIASES.get(phrase, phrase)
             if len(words[i:i + size]) == size and phrase in concepts:
-                terms.append(concepts[phrase])
+                terms.append((concepts[phrase], phrase))
                 understood.append(" ".join(words[i:i + size]))
                 i += size
                 break
@@ -625,8 +769,10 @@ def search_scores(query, results, styles, style_names):
                 ignored.append(w)
             i += 1
     score = np.ones(len(results))
-    for t in terms:
-        score *= (t / (t.max() or 1) + 1e-6) ** (1 / len(terms))
+    for t, phrase in terms:
+        # relative to the library's best, but a style nobody in the library has (0.001 at best) isn't a full match
+        floor = 0.05 if phrase in style_phrases else 0
+        score *= (t / (max(t.max(), floor) or 1) + 1e-6) ** (1 / len(terms))
     return np.where(keep, score, 0), understood, ignored
 
 
@@ -644,6 +790,7 @@ def search(argv):
     rows = [(p, b) for p, b in rows if p.exists()]
     if not rows:
         sys.exit("No analyzed tracks yet: run tagwerk on a folder first.")
+    _add_themes(db)  # tracks from tagwerk < 0.4
     results = [r for _, r, _ in _results(db, [p for p, _ in rows])]
     with _working("Reading the library"), _quiet_native():
         from .analyze import STYLES, _head  # the style head on cached embeddings: seconds, no re-analysis
@@ -680,6 +827,15 @@ def dupes(argv):
     print(f"{n} track{'s' * (n > 1)} saved more than once" if n else "No duplicates among the analyzed tracks.")
 
 
+def default_out(src):
+    """A Tagwerk folder next to the music; inside it when the music is a drive's root (/Volumes/STICK, /mnt/d),
+    whose parent nobody may write to."""
+    base = src if src.is_dir() else src.parent
+    if os.path.ismount(base) or not os.access(base.parent, os.W_OK):
+        return base / "Tagwerk"
+    return base.parent / "Tagwerk"
+
+
 PRESETS = {"1": ("Style › Mood › BPM", BY), "2": ("Style › BPM", "style,bpm"), "3": ("Mood › BPM", "mood,bpm"),
            "4": ("Key › BPM", "key,bpm"), "5": ("Energy › Style", "energy,style")}
 
@@ -691,24 +847,34 @@ def setup(argv):
     def ask(question, default):
         return input(f"{_c(BOLD, '?')} {question} {_c(DIM, f'[{_home(default)}]')} ").strip() or str(default)
 
+    def ask_path(question, default):
+        """A folder dragged into Terminal arrives quoted or with escaped spaces: take it as the shell would."""
+        s = ask(question, default)
+        try:
+            s = shlex.split(s)[0] if s[:1] in "'\"" or ("\\" in s and "/" in s) else s
+        except (ValueError, IndexError):
+            pass
+        return Path(s).expanduser().absolute()
+
     print(f"{_c(BOLD, f'tagwerk {VERSION}')} setup: a few questions, Enter keeps the default.\n")
     try:
-        while not (files := audio_files(src := Path(ask("Music folder to read", "~/Music")).expanduser())):
+        while not (files := audio_files(src := ask_path("Music folder to read", "~/Music"))):
             print(_c(YELLOW, f"  no audio files in {_home(src)}"))
         print(_c(DIM, f"  {len(files)} tracks"))
-        out = Path(ask("Where should the sorted copies go? Originals are never moved", src.parent / "Tagwerk"))
+        out = ask_path("Where should the sorted copies go? Originals are never moved", default_out(src))
         print("  Folder layout:")
         for k, (name, _) in PRESETS.items():
             print(f"    {_c(CYAN, k)}  {name}")
         while True:
-            by = ask(f"Pick one, or type levels like key,energy ({', '.join(LAYOUT)})", "1").replace(" ", "")
+            by = ask(f"Pick one, or type levels like key,energy ({', '.join(LAYOUT)})", "1").replace(" ", "").lower()
             by = PRESETS[by][1] if by in PRESETS else by
-            if all(k in LAYOUT for k in by.split(",")):
+            if not (unknown := [k for k in by.split(",") if k not in LAYOUT]):
                 break
+            print(_c(YELLOW, f"  unknown level(s): {', '.join(unknown)}"))
         compact = ask("Compact: one folder per combination (Techno - Dark - 140-144 BPM) instead of nested? y/n",
                       "n").lower().startswith("y")
         tags = ask("Also write tags into the files' Comment field (for rekordbox)? y/n", "n").lower().startswith("y")
-        cmd = [str(src), "--organize", str(out.expanduser()), "--by", by] + ["--compact"] * compact
+        cmd = [str(src), "--organize", str(out), "--by", by] + ["--compact"] * compact
         cmd += ["--write-tags"] * tags
         print(f"\nYour command, run it again any time to update:\n  {_c(BOLD, 'tagwerk ' + shlex.join(cmd))}\n")
         if ask("Run it now? y/n", "y").lower().startswith("y"):
@@ -722,7 +888,7 @@ COMMANDS = {"setup": setup, "edit": edit, "similar": similar, "search": search, 
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if argv and argv[0] in COMMANDS and not Path(argv[0]).exists():
+    if argv and argv[0] in COMMANDS and argv[0] not in os.listdir():  # exact name: 'Setup/' doesn't hide setup
         return COMMANDS[argv[0]](argv[1:])
     ap = argparse.ArgumentParser(
         prog="tagwerk", description="Analyze, tag and organize your music (BPM, key, style, mood).",
@@ -746,9 +912,10 @@ def main(argv=None):
     by = a.by.split(",")
     if unknown := [k for k in by if k not in LAYOUT]:
         ap.error(f"unknown --by level(s): {', '.join(unknown)}; choose from {', '.join(LAYOUT)}")
-    src = Path(os.path.abspath(a.folder))
-    base = src if src.is_dir() else src.parent
-    out = None if a.analyze_only else Path(a.organize or base.parent / "Tagwerk").expanduser().resolve()
+    src = disk_path(a.folder)
+    out = None if a.analyze_only else (disk_path(a.organize) if a.organize else default_out(src))
+    if out and (out == src or out in src.parents):
+        ap.error(f"--organize {_home(out)} contains {a.folder}: pick a folder outside it")
     csv_out = a.csv or (out / "tagwerk-report.csv" if out else None)
     begin = time.monotonic()
     print(f"{_c(BOLD, f'tagwerk {VERSION}')}  {_home(src)}" + (f" {_c(DIM, '→')} {_home(out)}" if out else ""))
@@ -764,12 +931,22 @@ def main(argv=None):
         analyze_new(db, files, a.limit, a.jobs)
     except KeyboardInterrupt:
         sys.exit("\nStopped. Everything analyzed so far is saved: run the same command again to resume.")
-    if a.write_tags:
-        write_tags(db, files)
-    if out:
-        organize(db, files, out, by, a.compact)
-    if csv_out:
-        export_csv(db, files, csv_out)
+    except urllib.error.URLError as e:
+        sys.exit(f"{_c(RED, 'Could not download the models')} (offline?): {e.reason}")
+    # every set sorted into this OUT before stays in its report and rekordbox.xml, not just this run's folder
+    have = {str(p) for p in files}
+    every = files + [Path(q) for q in dict.fromkeys(q for d, q in db.execute("SELECT dest, src FROM copies")
+                                                    if out and Path(d).is_relative_to(out) and q not in have)
+                     if Path(q).exists()]
+    try:
+        if a.write_tags:
+            write_tags(db, files)
+        if out:
+            organize(db, every, out, by, a.compact)
+        if csv_out:
+            export_csv(db, every, csv_out)
+    except KeyboardInterrupt:
+        sys.exit("\nStopped. What's done is saved: run the same command again to finish.")
     summary(db, files)
     print(_c(DIM, f"\nDone in {_duration(time.monotonic() - begin)}"))
 

@@ -1,9 +1,10 @@
 [project]
 name = "tagwerk"
-version = "0.7.0"
+version = "0.8.0"
 description = "Automatic categorization, tagging and folder organization of electronic music for DJs"
 requires-python = ">=3.10"
-dependencies = ["essentia-tensorflow", "mutagen", "numpy"]
+# 2.1b6.dev1389 is the first with macOS arm64 builds that match NumPy 2
+dependencies = ["essentia-tensorflow>=2.1b6.dev1389", "mutagen", "numpy"]
 
 [project.scripts]
 tagwerk = "tagwerk.cli:main"

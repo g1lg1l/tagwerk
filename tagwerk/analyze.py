@@ -94,6 +94,10 @@ class Analyzer:
 
     def analyze(self, path):
         audio = es.MonoLoader(filename=str(path), sampleRate=44100)()
+        if len(audio) < 3 * 44100:  # one-shots and FX: Essentia's error ('LIST_EMPTY') says nothing useful
+            raise ValueError("too short to analyze (under 3 s)")
+        if not abs(audio).max() > 1e-4:  # silence would come out as a 738 BPM "track"
+            raise ValueError("silent")
         bpm = self.rhythm(audio)[0]
         key, scale, strength = self.key(audio)
         audio16 = self.resample(audio)
