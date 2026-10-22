@@ -41,7 +41,7 @@ tagwerk setup
 What a run looks like:
 
 ```
-tagwerk 0.6.0  ~/Music/HardGroove Set → ~/Music/Tagwerk
+tagwerk 0.7.0  ~/Music/HardGroove Set → ~/Music/Tagwerk
 96 tracks · 94 already analyzed · 2 to analyze
 1/2  Ocean Drive.mp3     145.0  8A  #techno #hardgroove #energetic E5
 2/2  Moon Rotation.mp3   138.0  1A  #techno #deep-techno #deep #aggressive E5
@@ -121,6 +121,7 @@ Tagwerk/
 | `tagwerk FOLDER` | Analyzes FOLDER and its subfolders, copies and sorts into `Tagwerk/` next to it, writes the report and `rekordbox.xml` |
 | `tagwerk edit FILE_OR_FOLDER …` | Fix style, BPM, key, energy or mood by hand, add your own tags ([details](#fix-it-by-hand)) |
 | `tagwerk similar FILE` | The tracks that sound closest, ✓ for the ones you can mix into it |
+| `tagwerk search WORDS` | Find tracks by style, mood, BPM, key and your tags, e.g. `"dark acid techno 140"` |
 | `tagwerk dupes FOLDER` | Tracks saved more than once (another format, bitrate or name) |
 
 Every command has `--help`.
@@ -178,14 +179,19 @@ tagwerk edit ".../track.mp3" --reset
 
 **Tagwerk learns your tags.** Once a tag is on 5+ tracks, every track you haven't hand-tagged gets the hand tags of the most similar track you did, if it's similar enough. Wrong guess? `--remove` it on that track: it becomes a "not this" example and its neighbours follow.
 
-## Similar tracks and duplicates
+## Search, similar tracks, duplicates
 
 ```bash
-tagwerk similar ".../track.mp3" -n 10    # closest-sounding tracks, ✓ = within ±6% BPM and a compatible key
-tagwerk dupes ~/Music/playlists          # same track saved more than once, which one gets copied
+tagwerk search "dark hardgroove"            # every word must fit; the best matches first
+tagwerk search melodic tech trance 138-142
+tagwerk search deep techno 8A #warmup       # 8A: tracks that mix with it; #tags you added or tagwerk learned
+tagwerk similar ".../track.mp3" -n 10       # closest-sounding tracks, ✓ = within ±6% BPM and a compatible key
+tagwerk dupes ~/Music/playlists             # same track saved more than once, which one gets copied
 ```
 
-Both work from the cache: instant, no re-analysis.
+`search` knows the 400 style names (`dub techno`, `acid`, `hardgroove`, `dnb`…), the 56 mood labels (`dark`, `deep`, `melodic`, `emotional`, `groovy`, `energetic`…), `aggressive`, `chill`, `vocal`, `instrumental`, BPM (`140` = 137–143, or `138-142`), Camelot keys and `#tags`. Words it doesn't know are shown, not guessed.
+
+All three work from the cache: instant, no re-analysis.
 
 ## rekordbox and other DJ apps
 

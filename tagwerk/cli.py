@@ -563,6 +563,107 @@ def similar(argv):
         print(f"  {_c(DIM, sim)} {mark} {r['bpm']:>5.1f} {_c(CYAN, key)}  {_fit(style, 18)} {p.name}")
 
 
+# words that only make a query read well
+_STOP = {"a", "an", "and", "the", "with", "some", "of", "in", "for", "track", "tracks", "song", "songs", "music",
+         "vibe", "vibes", "style", "kind", "like", "very", "bit", "little", "really"}
+DNB = ("drum", "n", "bass")
+_ALIASES = {("hardgroove",): ("schranz",),  # the model's name for it (shown as Hardgroove below 150 BPM)
+            ("dnb",): DNB, ("d&b",): DNB, ("drum", "and", "bass"): DNB,
+            ("chill",): ("relaxed",), ("sad",): ("emotional",)}
+
+
+def _words(text):
+    return tuple(re.findall(r"[a-z0-9#&]+", text.lower()))
+
+
+def search_scores(query, results, styles, style_names):
+    """Ranks tracks for a query in tagwerk's own vocabulary: the 400 styles, the 56 mood/theme labels and the mood
+    groups (scores), BPM like 140 or 138-142, Camelot keys and #tags (filters). Every term must fit, so the score is
+    the geometric mean of each term's score relative to the library's best. Returns (scores, understood, ignored).
+    results: analyzed tracks; styles: their (n, 400) style scores."""
+    # ponytail: a fixed vocabulary, not free text; CLAP would understand "rolling" but needs PyTorch (#12)
+    concepts = {}
+
+    def concept(phrase, vec):
+        concepts[phrase] = np.maximum(concepts[phrase], vec) if phrase in concepts else vec
+
+    for i, name in enumerate(style_names):
+        concept(_words(name.split("---")[-1]), styles[:, i])
+    labels = results[0].get("themes") or {}
+    for label in labels:
+        concept((label,), np.array([r["themes"][label] for r in results]))
+    for group, members in MOOD_GROUPS.items():
+        concept(_words(group), np.array([max(r["themes"][m] for m in members) for r in results]))
+    for word, mood in [("aggressive", "aggressive"), ("relaxed", "relaxed"), ("happy", "happy"), ("vocal", "voice"),
+                       ("party", "party"), ("danceable", "danceable")]:
+        concept((word,), np.array([r["moods"][mood] for r in results]))
+    concept(("instrumental",), 1 - concepts[("vocal",)])
+
+    words, i, terms, keep, understood, ignored = _words(query), 0, [], np.ones(len(results), bool), [], []
+    while i < len(words):
+        for size in (4, 3, 2, 1):
+            phrase = words[i:i + size]
+            phrase = _ALIASES.get(phrase, phrase)
+            if len(words[i:i + size]) == size and phrase in concepts:
+                terms.append(concepts[phrase])
+                understood.append(" ".join(words[i:i + size]))
+                i += size
+                break
+        else:
+            w = words[i]
+            if m := re.fullmatch(r"(\d{2,3})(?:-(\d{2,3}))?", w):
+                lo, hi = (int(m[1]) - 3, int(m[1]) + 3) if not m[2] else (int(m[1]), int(m[2]))
+                keep &= np.array([lo <= r["bpm"] <= hi for r in results])
+                understood.append(f"{lo}-{hi} BPM")
+            elif KEY_RE.match(w.upper()):
+                keep &= np.array([compatible(r["camelot"], w.upper()) for r in results])
+                understood.append(f"mixes with {w.upper()}")
+            elif w.startswith("#"):
+                keep &= np.array([tag(w) in build_tags(r) for r in results])
+                understood.append(tag(w))
+            elif w not in _STOP:
+                ignored.append(w)
+            i += 1
+    score = np.ones(len(results))
+    for t in terms:
+        score *= (t / (t.max() or 1) + 1e-6) ** (1 / len(terms))
+    return np.where(keep, score, 0), understood, ignored
+
+
+def search(argv):
+    ap = argparse.ArgumentParser(
+        prog="tagwerk search", description="Find tracks by words: styles (dub techno, acid…), moods (dark, deep, "
+        "emotional…), BPM (140, 138-142), keys (8A: what mixes with it) and your #tags. Every word must fit.",
+        epilog='e.g. tagwerk search "dark acid techno 140"')
+    ap.add_argument("query", nargs="+")
+    ap.add_argument("-n", type=int, default=15, help="how many (default: 15)")
+    ap.add_argument("--db", default=DB)
+    a = ap.parse_args(argv)
+    db = open_db(a.db)
+    rows = [(Path(p), b) for p, b in db.execute("SELECT path, embedding FROM tracks WHERE embedding IS NOT NULL")]
+    rows = [(p, b) for p, b in rows if p.exists()]
+    if not rows:
+        sys.exit("No analyzed tracks yet: run tagwerk on a folder first.")
+    results = [r for _, r, _ in _results(db, [p for p, _ in rows])]
+    with _working("Reading the library"), _quiet_native():
+        from .analyze import STYLES, _head  # the style head on cached embeddings: seconds, no re-analysis
+        head, names = _head(STYLES)
+        styles = head(np.stack([np.frombuffer(b, np.float32) for _, b in rows]))
+    score, understood, ignored = search_scores(" ".join(a.query), results, styles, names)
+    if not understood:
+        ap.error("no word I know: try styles (dub techno), moods (dark, deep), BPM (140), keys (8A) or #tags")
+    print(f"{_c(DIM, 'looking for')} {' · '.join(_c(BOLD, u) for u in understood)}"
+          + (_c(YELLOW, f"   not understood: {', '.join(ignored)}") if ignored else ""))
+    order = [i for i in score.argsort()[::-1] if score[i] > 0][:a.n]
+    for i in order:
+        (p, _), r = rows[i], results[i]
+        width = max(1, round(score[i] * 10))
+        bar, key = _c(CYAN, "█" * width) + " " * (10 - width), f"{r['camelot']:>3}"
+        print(f"  {bar} {r['bpm']:>5.1f} {_c(CYAN, key)}  {_fit(_style(r), 16)} {_fit(mood_of(r), 10)} {p.name}")
+    if not order:
+        print(_c(YELLOW, "  nothing fits all of that"))
+
+
 def dupes(argv):
     ap = argparse.ArgumentParser(prog="tagwerk dupes", description="Tracks saved more than once (another format, "
                                  "bitrate or name). --organize copies only the first of each group.")
@@ -616,7 +717,7 @@ def setup(argv):
         print()
 
 
-COMMANDS = {"setup": setup, "edit": edit, "similar": similar, "dupes": dupes}
+COMMANDS = {"setup": setup, "edit": edit, "similar": similar, "search": search, "dupes": dupes}
 
 
 def main(argv=None):
@@ -625,7 +726,7 @@ def main(argv=None):
         return COMMANDS[argv[0]](argv[1:])
     ap = argparse.ArgumentParser(
         prog="tagwerk", description="Analyze, tag and organize your music (BPM, key, style, mood).",
-        epilog="new here? tagwerk setup asks a few questions instead. more: tagwerk edit|similar|dupes --help")
+        epilog="new here? tagwerk setup asks a few questions instead. more: tagwerk edit|similar|search|dupes --help")
     ap.add_argument("--version", action="version", version=f"tagwerk {VERSION}")
     ap.add_argument("folder", help="folder to analyze (recursive)")
     ap.add_argument("--organize", metavar="OUT",

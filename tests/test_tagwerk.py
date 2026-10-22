@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np  # noqa: E402
 
 from tagwerk.cli import (MOODS, _location, _results, edit, find_dupes, main, open_db, organize,  # noqa: E402
-                         summary)
+                         search_scores, summary)
 from tagwerk.tags import (apply_manual, build_tags, camelot, clean_filename, clean_title, compatible,  # noqa: E402
                           energy, fold_bpm, folder_for, key_name, merge_comment, relabel_styles, tag)
 
@@ -258,6 +258,23 @@ def test_clean_title():
     for dirty, clean in cases.items():
         assert clean_title(dirty) == clean, (dirty, clean_title(dirty))
     assert clean_filename(Path("03. Artist - A:B? (Free DL).mp3")) == "Artist - A-B-.mp3"
+
+
+def test_search_scores():
+    def track(bpm, camelot, dark):
+        return {"bpm": bpm, "camelot": camelot, "themes": THEMES | {"dark": dark}, "arousal": 5.0,
+                "styles": [("Electronic---Techno", 1)], "moods": dict.fromkeys(MOODS, 0.1),
+                "manual": {"add": ["#peak"]} if dark > .5 else {}}
+    results = [track(140, "8A", 0.9), track(141, "9A", 0.8), track(128, "8A", 0.9), track(140, "3B", 0.1)]
+    names = ["Electronic---Acid", "Electronic---Techno", "Electronic---Drum n Bass"]
+    styles = np.array([[0.1, 0.9, 0], [0.9, 0.8, 0], [0.9, 0.9, 0], [0.9, 0.9, 0]])
+    score, understood, ignored = search_scores("dark acid techno with a rolling 140", results, styles, names)
+    assert understood == ["dark", "acid", "techno", "137-143 BPM"] and ignored == ["rolling"]
+    assert score.argmax() == 1 and score[2] == 0  # all three words fit best; 128 BPM is filtered out
+    assert score[3] < score[1]  # not dark
+    score, understood, _ = search_scores("dnb 8a #peak", results, styles, names)
+    assert understood == ["dnb", "mixes with 8A", "#peak"]
+    assert list(score > 0) == [True, True, True, False]  # 3B doesn't mix with 8A, and has no #peak
 
 
 def test_compatible():
